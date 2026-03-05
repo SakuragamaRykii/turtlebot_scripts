@@ -572,7 +572,6 @@ class CubeDetectorNode(Node):
             'area': cube['area']
         }
 
-
 def main(args=None):
     rclpy.init(args=args)
     node = CubeDetectorNode()
