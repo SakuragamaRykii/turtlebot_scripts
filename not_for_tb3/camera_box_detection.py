@@ -12,7 +12,7 @@ class BlueCubeDetector:
         # Cube-specific parameters
         self.min_area = 1000
         self.max_area = 50000  # Maximum expected cube size
-        self.solidity_threshold = 0.85  # Cubes are very solid
+        self.solidity_threshold = 0.82  # Cubes are very solid
         self.aspect_ratio_range = (0.7, 1.3)  # Square-like shape
         
         # 3D cue parameters
