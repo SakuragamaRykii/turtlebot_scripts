@@ -50,14 +50,14 @@ class RedCubePatrol(Node):
             Odometry,
             '/odom',
             self.odom_callback,
-            10
+            qos_profile_sensor_data
         )
 
         self.image_sub = self.create_subscription(
             Image,
             '/camera/image_raw',
             self.image_callback,
-            10
+            qos_profile_sensor_data
         )
 
         self.control_timer = self.create_timer(0.10, self.control_loop)   # 10 Hz
@@ -123,8 +123,11 @@ class RedCubePatrol(Node):
         return math.atan2(siny_cosp, cosy_cosp)
 
     def stop_robot(self):
-        msg = Twist()
-        self.cmd_pub.publish(msg)
+        try:
+            msg = Twist()
+            self.cmd_pub.publish(msg)
+        except Exception:
+            pass
 
     def publish_cmd(self, linear_x=0.0, angular_z=0.0):
         msg = Twist()
@@ -406,10 +409,17 @@ class RedCubePatrol(Node):
             print(f"[WARN] Unknown state: {self.state}")
 
     def status_loop(self):
-        # 每秒播报一次状态
-        if not self.ready():
-            print("[STATUS] waiting_for_data=True")
-            return
+        print(
+            f"[STATUS] ready={self.ready()} "
+            f"has_scan={self.has_scan} "
+            f"has_odom={self.has_odom} "
+            f"has_image={self.has_image} "
+            f"state={self.state} "
+            f"pos=[{self.local_x:.2f}, {self.local_y:.2f}] "
+            f"yaw_deg={math.degrees(self.local_yaw):.1f} "
+            f"front_dist={self.front_dist:.2f} "
+            f"red_visible={self.red_visible}"
+        )
 
         print(
             f"[STATUS] "
