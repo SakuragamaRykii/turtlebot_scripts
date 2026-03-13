@@ -10,7 +10,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import LaserScan, CompressedImage
 
 
 class RedCubePatrol(Node):
@@ -54,8 +54,8 @@ class RedCubePatrol(Node):
         )
 
         self.image_sub = self.create_subscription(
-            Image,
-            '/camera/image_raw',
+            CompressedImage,
+            '/camera/image_raw/compressed',
             self.image_callback,
             qos_profile_sensor_data
         )
@@ -205,7 +205,8 @@ class RedCubePatrol(Node):
         self.has_image = True
 
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         except Exception as e:
             self.red_visible = False
             print(f"[WARN] Camera conversion failed: {e}")
