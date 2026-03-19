@@ -23,6 +23,8 @@ class RedCubePatrol(Node):
         self.BACKWARD_SPEED = -0.04
         self.TRACK_SPEED = 0.05
         self.TRACK_SLOW_SPEED = 0.03
+        
+        self.SEARCH_SPEED = 0.25  # Smooth 360 scanning speed (Rad/s). Adjust if needed.
 
         self.SEARCH_MAX_ANG = 0.16
         self.SEARCH_MIN_ANG = 0.04
@@ -116,8 +118,7 @@ class RedCubePatrol(Node):
         self.turn_target_yaw = 0.0
         
         # New variables for Smart Sweeping
-        self.best_cube_yaw = None
-        self.best_cube_area = 0.0
+        self.first_cube_yaw = None
         self.CENTER_FOV_RATIO = 0.50
 
         self.segment_start = np.array([0.0, 0.0], dtype=float)
@@ -223,8 +224,7 @@ class RedCubePatrol(Node):
         if new_state == 'SEARCH_ROTATE':
             self.search_prev_yaw = self.local_yaw
             self.search_accum_yaw = 0.0
-            self.best_cube_yaw = None
-            self.best_cube_area = 0.0
+            self.first_cube_yaw = None
         elif new_state == 'PATROL_FORWARD':
             self.begin_new_segment_here()
         elif new_state == 'TURN_LEFT_90':
@@ -359,21 +359,20 @@ class RedCubePatrol(Node):
     # 状态行为函数
     # =========================
     def handle_search_rotate(self):
-        # 1. Check for target and log it IF it's within the central FOV
+        # 1. Check for target and log the FIRST one we see
         if self.target_seen():
             error = abs(self.target_error_pixels())
             allowed_fov_pixels = self.image_width * (self.CENTER_FOV_RATIO / 2.0)
             
             if error <= allowed_fov_pixels:
-                # Target is centered! Log its size and rotation angle.
-                if self.red_area > self.best_cube_area:
-                    self.best_cube_area = self.red_area
-                    self.best_cube_yaw = self.local_yaw
+                # Log the first centered cube and stop logging others
+                if self.first_cube_yaw is None:
+                    self.first_cube_yaw = self.local_yaw
+                    print(f"[EVENT] First cube spotted at yaw: {math.degrees(self.first_cube_yaw):.1f}")
 
-        # 2. Continue the 360 rotation
+        # 2. Safely accumulate rotation (Fixes the early-exit / vibration bug)
         delta = self.normalize_angle(self.local_yaw - self.search_prev_yaw)
-        if delta > 0.0:
-            self.search_accum_yaw += delta
+        self.search_accum_yaw += abs(delta)  # <-- The abs() fixes the math bug
         self.search_prev_yaw = self.local_yaw
 
         remaining = 2.0 * math.pi - self.search_accum_yaw
@@ -381,17 +380,15 @@ class RedCubePatrol(Node):
             self.stop_robot_once()
             
             # 3. Scan finished. Did we log a cube?
-            if self.best_cube_yaw is not None:
-                self.turn_target_yaw = self.best_cube_yaw
-                self.set_state('TURN_TO_LOGGED_TARGET', 'Scan complete. Returning to logged cube.')
+            if self.first_cube_yaw is not None:
+                self.turn_target_yaw = self.first_cube_yaw
+                self.set_state('TURN_TO_LOGGED_TARGET', 'Scan complete. Returning to FIRST logged cube.')
             else:
                 self.set_state('PATROL_FORWARD', 'Startup scan finished. No cube found. Enter patrol.')
             return
 
-        angular = min(self.SEARCH_MAX_ANG, 0.55 * remaining)
-        if remaining > 0.20:
-            angular = max(self.SEARCH_MIN_ANG, angular)
-        self.publish_cmd(0.0, angular)
+        # 4. Command the constant, adjustable speed
+        self.publish_cmd(0.0, self.SEARCH_SPEED)
 
     def handle_turn_to_logged_target(self):
         error = self.normalize_angle(self.turn_target_yaw - self.local_yaw)
@@ -464,7 +461,6 @@ class RedCubePatrol(Node):
                 self.set_state('SEARCH_ROTATE', 'Target reached (slipped under camera). Resume search.')
         else:
             self.set_state('SEARCH_ROTATE', 'Target lost at a distance. Restart search.')
-
 
     def handle_patrol_forward(self):
         if self.target_seen():
