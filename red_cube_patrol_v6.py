@@ -19,12 +19,12 @@ class RedCubePatrol(Node):
         # =========================
         # 参数（真机测试版）
         # =========================
-        self.PATROL_SPEED = 0.05
+        self.PATROL_SPEED = 0.1
         self.BACKWARD_SPEED = -0.04
-        self.TRACK_SPEED = 0.05
-        self.TRACK_SLOW_SPEED = 0.03
+        self.TRACK_SPEED = 0.1
+        self.TRACK_SLOW_SPEED = 0.05
         
-        self.SEARCH_SPEED = 0.25  # Smooth 360 scanning speed (Rad/s). Adjust if needed.
+        self.SEARCH_SPEED = 0.4  # Smooth 360 scanning speed (Rad/s). Adjust if needed.
 
         self.SEARCH_MAX_ANG = 0.16
         self.SEARCH_MIN_ANG = 0.04
