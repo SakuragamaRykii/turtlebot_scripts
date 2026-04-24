@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
+"""
+TurtleBot3 Cube Sorting System
+- Maps arena dimensions using LiDAR
+- Detects cubes in wrong zones and navigates to them
+- State machine based control system
+"""
+
 import math
 import threading
 import time
 from dataclasses import dataclass
-from enum import Enum
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -15,14 +22,22 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, LaserScan
 
 
-class Zone(Enum):
-    RED = 'red'
-    BLUE = 'blue'
-    UNKNOWN = 'unknown'
+@dataclass
+class CubeInfo:
+    """Information about a detected cube"""
+    color: str
+    angle: float  # Angle in radians relative to robot's initial orientation
+    distance: float  # Estimated distance in meters
+    cx: float  # Center x in image
+    cy: float  # Center y in image
+    area: float
+    bbox_w: int
+    bbox_h: int
 
 
 @dataclass
-class CubeObservation:
+class ObsCube:
+    """Observation data from camera"""
     color: str
     cx: float
     cy: float
@@ -41,64 +56,32 @@ class CubeObservation:
     color_conf: float
 
 
-class TrackingCubeV3(Node):
+class CubeSorter(Node):
     def __init__(self):
-        super().__init__('tracking_cube_v3')
+        super().__init__('cube_sorter')
 
-        self.TARGET_COLOR = 'any'
+        # Configuration parameters
+        self.ROTATION_SPEED = 0.3  # rad/s for search rotation
+        self.FORWARD_SPEED = 0.08  # m/s for approach
+        self.ALIGN_ROTATION_SPEED = 0.4  # rad/s for alignment
+        self.APPROACH_STOP_DIST = 0.15  # Stop distance from cube in meters
+        self.WALL_SAFE_DIST = 0.3  # Safe distance from walls
+        self.CENTER_ARRIVAL_TOL = 0.1  # Tolerance for reaching center
+        self.ANGLE_ARRIVAL_TOL = 0.05  # rad tolerance for angle alignment
+        self.PIXEL_ALIGN_TOL = 30  # Pixel tolerance for cube alignment
 
-        self.PATROL_SPEED = 0.05
-        self.BACKWARD_SPEED = -0.04
-        self.APPROACH_FAST_SPEED = 0.05
-        self.APPROACH_SLOW_SPEED = 0.024
+        # Camera parameters
+        self.MIN_CONTOUR_AREA = 500
+        self.MIN_BBOX_W = 20
+        self.MIN_BBOX_H = 20
+        self.MAX_ASPECT_RATIO = 2.0
+        self.MIN_ASPECT_RATIO = 0.5
+        self.MIN_FILL_RATIO = 0.3
+        self.MIN_EXTENT = 0.25
+        self.MIN_SOLIDITY = 0.7
+        self.MIN_CENTER_Y_RATIO = 0.15
 
-        self.SEARCH_ANG = 0.22
-        self.ALIGN_MIN_ANG = 0.04
-        self.ALIGN_MAX_ANG = 0.20
-        self.TURN_MIN_ANG = 0.05
-        self.TURN_MAX_ANG = 0.18
-        self.RECOVER_ANG = 0.12
-
-        self.WALL_STOP_DIST = 0.32
-        self.EMERGENCY_STOP_DIST = 0.12
-        self.HARD_FRONT_STOP_DIST = 0.16
-
-        self.SEARCH_DONE_TOL = math.radians(4.0)
-        self.TURN_YAW_TOL = math.radians(3.0)
-        self.MIDPOINT_TOL = 0.025
-
-        self.ALIGN_PIXEL_TOL = 18
-        self.APPROACH_ROTATE_ONLY_PX = 110
-        self.REACQUIRE_PIXEL_TOL = 85
-        self.CENTER_HOLD_FRAMES = 3
-        self.CONFIRM_FRAMES = 4
-        self.LOST_TARGET_TIMEOUT = 0.70
-
-        self.MIN_CONTOUR_AREA = 260
-        self.MIN_TRACK_AREA = 320
-        self.SEARCH_LOCK_MIN_AREA = 620
-        self.MIN_BBOX_W = 14
-        self.MIN_BBOX_H = 14
-        self.MAX_ASPECT_RATIO = 1.80
-        self.MIN_ASPECT_RATIO = 0.55
-        self.MIN_FILL_RATIO = 0.28
-        self.MIN_EXTENT = 0.22
-        self.MIN_SOLIDITY = 0.70
-        self.MIN_CENTER_Y_RATIO = 0.18
-        self.MAX_RAW_JUMP_PX = 90.0
-
-        self.MIN_HOLES_FOR_RANGE = 3
-        self.SLOW_HOLE_PITCH_PX = 14.0
-        self.STOP_HOLE_PITCH_PX = 20.0
-        self.STOP_BBOX_H_PX = 158
-
-        self.CONTROL_DT = 0.05
-        self.STATUS_DT = 1.0
-
-        # ROI alignment parameters
-        self.ROI_SIZE = 320
-        self.USE_ROI_ALIGNMENT = True
-
+        # ROS2 setup
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.scan_sub = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data
@@ -113,545 +96,295 @@ class TrackingCubeV3(Node):
             qos_profile_sensor_data,
         )
 
-        self.control_timer = self.create_timer(self.CONTROL_DT, self.control_loop)
-        self.status_timer = self.create_timer(self.STATUS_DT, self.status_loop)
+        self.control_timer = self.create_timer(0.05, self.control_loop)
+        self.status_timer = self.create_timer(1.0, self.status_loop)
 
+        # State variables
+        self.state = 'INIT'
+        self.prev_state = None
+        self.state_start_time = time.monotonic()
+
+        # Sensor data
         self.has_scan = False
         self.has_odom = False
         self.has_image = False
-
         self.front_dist = float('inf')
-        self.left_front_dist = float('inf')
-        self.right_front_dist = float('inf')
+        self.left_dist = float('inf')
+        self.right_dist = float('inf')
+        self.back_dist = float('inf')
 
-        # World coordinate tracking
+        # Odometry - Absolute position
         self.world_x = 0.0
         self.world_y = 0.0
         self.world_yaw = 0.0
-        self.init_world_x = None
-        self.init_world_y = None
-        self.init_world_yaw = None
-
-        # Local coordinate tracking (relative to origin set at 's' press)
-        self.origin_set = False
-        self.origin_x = 0.0
-        self.origin_y = 0.0
-        self.origin_yaw = 0.0
+        
+        # Arena dimensions (initialized in INIT state)
+        self.arena_length = 0.0  # X dimension
+        self.arena_width = 0.0   # Y dimension
+        self.arena_center = np.array([0.0, 0.0])
+        
+        # Local coordinate system (relative to initial position)
+        self.init_x = None
+        self.init_y = None
+        self.init_yaw = None
         self.local_x = 0.0
         self.local_y = 0.0
         self.local_yaw = 0.0
 
-        # Velocity tracking for position estimation
-        self.last_odom_time = None
-        self.linear_velocity = 0.0
-        self.angular_velocity = 0.0
-
+        # Cube detection
+        self.correct_cubes: List[CubeInfo] = []
+        self.wrong_cubes: List[CubeInfo] = []
+        self.current_search_angle = 0.0
+        self.search_start_yaw = 0.0
+        self.search_rotated = 0.0
+        self.target_cube: Optional[CubeInfo] = None
+        
+        # Current detection
+        self.current_cubes: List[ObsCube] = []
         self.image_width = None
         self.image_height = None
 
-        self.target_visible = False
-        self.target_obs = None
-        self.filtered_cx = None
-        self.filtered_cy = None
-        self.filtered_pitch = 0.0
-        self.filtered_diam = 0.0
-        self.filtered_bbox_h = 0.0
-        self.target_seen_frames = 0
-        self.last_target_seen_time = 0.0
-        self.last_target_dir = 1.0
-        self.last_target_pitch = 0.0
-        self.last_target_color = 'none'
-        self.prev_raw_obs = None
-
-        self.state = 'IDLE'
-        self.state_enter_time = time.monotonic()
-        self.search_prev_yaw = None
-        self.search_accum_yaw = 0.0
-        self.turn_target_yaw = 0.0
-
-        self.segment_start = np.array([0.0, 0.0], dtype=float)
-        self.segment_heading_yaw = 0.0
-        self.segment_length = 0.0
-        self.segment_mid_progress = 0.0
-
-        self.shutdown_requested = False
-        self.shutdown_reason = ''
-        self.shutdown_count = 0
-        self.manual_stop_requested = False
-        self.wait_status_last = None
-
+        # Console input thread
         self.console_thread = threading.Thread(target=self.console_loop, daemon=True)
         self.console_thread.start()
 
-        print('[BOOT] TrackingCube_V3 started')
-        print('[CMD] 输入 S 设置原点并开始搜索')
-        print('[CMD] 输入 H 停车并退出')
+        self.get_logger().info('Cube Sorter initialized')
+        print('[SYSTEM] Cube Sorter started - Press S to start search, H to halt')
 
-    def normalize_angle(self, angle):
+    def normalize_angle(self, angle: float) -> float:
+        """Normalize angle to [-pi, pi]"""
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def quaternion_to_yaw(self, q):
+    def quaternion_to_yaw(self, q) -> float:
+        """Convert quaternion to yaw angle"""
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
-    def clamp(self, value, low, high):
-        return max(low, min(high, value))
+    def publish_cmd(self, linear: float = 0.0, angular: float = 0.0):
+        """Publish velocity command"""
+        msg = Twist()
+        msg.linear.x = float(linear)
+        msg.angular.z = float(angular)
+        self.cmd_pub.publish(msg)
 
-    def clamp_abs(self, value, min_abs, max_abs):
-        if abs(value) < 1e-9:
-            return 0.0
-        sign = 1.0 if value > 0.0 else -1.0
-        mag = self.clamp(abs(value), min_abs, max_abs)
-        return sign * mag
-
-    def publish_cmd(self, linear_x=0.0, angular_z=0.0):
-        try:
-            msg = Twist()
-            msg.linear.x = float(linear_x)
-            msg.angular.z = float(angular_z)
-            self.cmd_pub.publish(msg)
-            # Store for position estimation
-            self.linear_velocity = linear_x
-            self.angular_velocity = angular_z
-        except Exception:
-            pass
-
-    def stop_robot_once(self):
+    def stop_robot(self):
+        """Stop the robot"""
         self.publish_cmd(0.0, 0.0)
 
-    def stop_robot_reliable(self, repeat=12, delay=0.03):
-        for _ in range(repeat):
-            self.stop_robot_once()
-            time.sleep(delay)
-
-    def ready(self):
-        return self.has_scan and self.has_odom and self.has_image
-
-    def current_pos(self):
-        return np.array([self.local_x, self.local_y], dtype=float)
-
-    def get_zone_at_position(self, x, y):
-        """Determine which zone a position belongs to.
-        Right of origin (+x) = RED zone, Left of origin (-x) = BLUE zone."""
-        if not self.origin_set:
-            return Zone.UNKNOWN
-        if x >= 0:
-            return Zone.RED
-        else:
-            return Zone.BLUE
-
-    def is_cube_in_wrong_zone(self, cube_color):
-        """Check if a cube of given color is in the wrong zone.
-        Since we can't know cube's world position from camera alone,
-        we assume the robot is looking at it and use robot's position."""
-        if not self.origin_set:
-            return False
-        
-        robot_zone = self.get_zone_at_position(self.local_x, self.local_y)
-        
-        # Red cube should be in RED zone, Blue cube should be in BLUE zone
-        if cube_color == 'red':
-            return robot_zone != Zone.RED
-        elif cube_color == 'blue':
-            return robot_zone != Zone.BLUE
-        return False
-
-    def begin_new_segment_here(self):
-        self.segment_start = self.current_pos().copy()
-        self.segment_heading_yaw = self.local_yaw
-        self.segment_length = 0.0
-        self.segment_mid_progress = 0.0
-
-    def current_progress_along_segment(self):
-        direction = np.array([
-            math.cos(self.segment_heading_yaw),
-            math.sin(self.segment_heading_yaw),
-        ])
-        return float(np.dot(self.current_pos() - self.segment_start, direction))
-
-    def target_recently_seen(self):
-        return (time.monotonic() - self.last_target_seen_time) <= self.LOST_TARGET_TIMEOUT
-
-    def target_error_pixels(self):
-        if not self.target_visible or self.image_width is None or self.target_obs is None:
-            return None
-        return self.target_obs.cx - self.image_width / 2.0
-
-    def lockworthy_target(self):
-        if not self.target_visible or self.target_obs is None or self.image_height is None:
-            return False
-        obs = self.target_obs
-        if obs.area < self.SEARCH_LOCK_MIN_AREA:
-            return False
-        if obs.cy < self.image_height * self.MIN_CENTER_Y_RATIO:
-            return False
-        if obs.fill_ratio < self.MIN_FILL_RATIO:
-            return False
-        if obs.extent < self.MIN_EXTENT:
-            return False
-        if obs.solidity < self.MIN_SOLIDITY:
-            return False
-        return True
-
-    def target_confirmed(self):
-        if not self.lockworthy_target():
-            return False
-        if self.target_seen_frames < self.CONFIRM_FRAMES:
-            return False
-        # Only confirm if cube is in wrong zone (when origin is set)
-        if self.origin_set:
-            return self.is_cube_in_wrong_zone(self.target_obs.color)
-        return True
-
-    def target_close_enough(self):
-        if not self.target_visible or self.target_obs is None:
-            return False
-        by_holes = (
-            self.target_obs.holes >= self.MIN_HOLES_FOR_RANGE
-            and self.target_obs.hole_pitch >= self.STOP_HOLE_PITCH_PX
-        )
-        by_bbox = (
-            self.target_obs.bbox_h >= self.STOP_BBOX_H_PX
-            and self.target_obs.area >= max(900.0, self.SEARCH_LOCK_MIN_AREA)
-        )
-        by_lidar = self.front_dist <= self.HARD_FRONT_STOP_DIST
-        return by_holes or by_bbox or by_lidar
-
-    def set_state(self, new_state, text=None):
-        if self.state == new_state:
-            return
-        self.state = new_state
-        self.state_enter_time = time.monotonic()
-        if new_state == 'SEARCH_SWEEP':
-            self.search_prev_yaw = self.local_yaw
-            self.search_accum_yaw = 0.0
-        elif new_state == 'PATROL_FORWARD':
-            self.begin_new_segment_here()
-        elif new_state == 'TURN_LEFT_90':
-            self.turn_target_yaw = self.normalize_angle(self.local_yaw + math.pi / 2.0)
-        if text:
-            print(f'[STATE] {new_state} | {text}')
-        else:
+    def set_state(self, new_state: str):
+        """Change state with logging"""
+        if self.state != new_state:
+            self.prev_state = self.state
+            self.state = new_state
+            self.state_start_time = time.monotonic()
             print(f'[STATE] {new_state}')
 
-    def request_shutdown(self, reason):
-        if self.shutdown_requested:
-            return
-        self.shutdown_requested = True
-        self.shutdown_reason = reason
-        self.shutdown_count = 0
-        print(f'[STOP] {reason}')
-
-    def set_origin(self):
-        """Set current position as origin (0,0) with forward facing +x."""
-        self.origin_set = True
-        self.origin_x = self.world_x
-        self.origin_y = self.world_y
-        self.origin_yaw = self.world_yaw
-        self.local_x = 0.0
-        self.local_y = 0.0
-        self.local_yaw = 0.0
-        print(f'[ORIGIN] 原点已设置。右侧为红区 (+x)，左侧为蓝区 (-x)')
-
     def console_loop(self):
+        """Handle console input commands"""
         while True:
             try:
                 cmd = input().strip().lower()
-            except EOFError:
+            except (EOFError, Exception):
                 return
-            except Exception:
-                return
-            if cmd == 'h':
-                self.manual_stop_requested = True
-                self.request_shutdown('收到 H 指令，停车并退出')
-                return
-            if cmd == 's':
-                if not self.origin_set:
-                    self.set_origin()
-                    if self.state == 'IDLE':
-                        self.set_state('SEARCH_SWEEP', '原点已设置，开始搜索错误区域方块')
-                    else:
-                        print('[INFO] 原点已更新')
-                else:
-                    print('[INFO] 原点已存在，继续当前任务')
-                continue
-            if cmd in ('q', 'quit', 'exit'):
-                self.request_shutdown('收到退出指令')
-                return
+            
+            if cmd == 's' and self.state == 'IDLE':
+                self.set_state('SEARCH')
+                self.correct_cubes.clear()
+                self.wrong_cubes.clear()
+                print('[CMD] Starting cube search')
+            elif cmd == 'h':
+                self.set_state('IDLE')
+                self.stop_robot()
+                print('[CMD] Halt command received - Returning to IDLE')
+            elif cmd in ('q', 'quit', 'exit'):
+                print('[CMD] Shutdown requested')
+                self.stop_robot()
+                rclpy.shutdown()
 
-    def scan_callback(self, msg):
-        front_vals = list(msg.ranges[0:8]) + list(msg.ranges[352:360])
-        left_front_vals = list(msg.ranges[15:45])
-        right_front_vals = list(msg.ranges[315:345])
-
-        def valid_min(vals):
-            good = [x for x in vals if math.isfinite(x) and x > 0.05]
-            return min(good) if good else float('inf')
-
-        raw_front = valid_min(front_vals)
-        raw_left_front = valid_min(left_front_vals)
-        raw_right_front = valid_min(right_front_vals)
-
-        if not self.has_scan:
-            self.front_dist = raw_front
-            self.left_front_dist = raw_left_front
-            self.right_front_dist = raw_right_front
-        else:
-            alpha = 0.55
-            self.front_dist = alpha * self.front_dist + (1.0 - alpha) * raw_front
-            self.left_front_dist = alpha * self.left_front_dist + (1.0 - alpha) * raw_left_front
-            self.right_front_dist = alpha * self.right_front_dist + (1.0 - alpha) * raw_right_front
+    def scan_callback(self, msg: LaserScan):
+        """Process LiDAR data"""
+        ranges = np.array(msg.ranges)
+        
+        # Filter out invalid readings
+        valid_mask = np.isfinite(ranges) & (ranges > 0.05)
+        safe_ranges = np.where(valid_mask, ranges, float('inf'))
+        
+        # Get directional distances
+        self.front_dist = float(np.min(safe_ranges[350:360].tolist() + safe_ranges[0:10].tolist()))
+        self.left_dist = float(np.min(safe_ranges[75:105]))
+        self.right_dist = float(np.min(safe_ranges[255:285]))
+        self.back_dist = float(np.min(safe_ranges[165:195]))
+        
         self.has_scan = True
 
-    def odom_callback(self, msg):
+    def odom_callback(self, msg: Odometry):
+        """Process odometry data"""
         self.world_x = msg.pose.pose.position.x
         self.world_y = msg.pose.pose.position.y
         self.world_yaw = self.quaternion_to_yaw(msg.pose.pose.orientation)
-
-        if self.init_world_x is None:
-            self.init_world_x = self.world_x
-            self.init_world_y = self.world_y
-            self.init_world_yaw = self.world_yaw
-            print('[INFO] odom initialized')
-
-        # Update local position relative to origin (if set)
-        if self.origin_set:
-            dx = self.world_x - self.origin_x
-            dy = self.world_y - self.origin_y
-            c = math.cos(-self.origin_yaw)
-            s = math.sin(-self.origin_yaw)
-            self.local_x = c * dx - s * dy
-            self.local_y = s * dx + c * dy
-            self.local_yaw = self.normalize_angle(self.world_yaw - self.origin_yaw)
+        
+        # Initialize local coordinate system on first odom message
+        if self.init_x is None:
+            self.init_x = self.world_x
+            self.init_y = self.world_y
+            self.init_yaw = self.world_yaw
+            print(f'[INIT] Local coordinate system initialized at ({self.init_x:.2f}, {self.init_y:.2f})')
+        
+        # Calculate local coordinates
+        dx = self.world_x - self.init_x
+        dy = self.world_y - self.init_y
+        cos_init = math.cos(-self.init_yaw)
+        sin_init = math.sin(-self.init_yaw)
+        
+        self.local_x = cos_init * dx - sin_init * dy
+        self.local_y = sin_init * dx + cos_init * dy
+        self.local_yaw = self.normalize_angle(self.world_yaw - self.init_yaw)
         
         self.has_odom = True
 
-    def image_callback(self, msg):
+    def image_callback(self, msg: CompressedImage):
+        """Process camera image"""
         self.has_image = True
+        
         try:
             np_arr = np.frombuffer(msg.data, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is None:
-                raise ValueError('decoded frame is None')
+                return
         except Exception:
-            self.target_visible = False
-            self.target_obs = None
-            self.target_seen_frames = 0
-            self.prev_raw_obs = None
             return
-
+        
         self.image_height, self.image_width = frame.shape[:2]
-        obs = self.detect_best_cube(frame)
+        self.current_cubes = self.detect_cubes(frame)
 
-        if obs is None:
-            self.target_visible = False
-            self.target_obs = None
-            self.target_seen_frames = 0
-            self.prev_raw_obs = None
-            return
+    def build_color_mask(self, hsv: np.ndarray, bgr: np.ndarray, color: str) -> np.ndarray:
+        """Build mask for specific color"""
+        if color == 'red':
+            lower1 = np.array([0, 100, 50])
+            upper1 = np.array([10, 255, 255])
+            lower2 = np.array([170, 100, 50])
+            upper2 = np.array([180, 255, 255])
+            hsv_mask = cv2.bitwise_or(
+                cv2.inRange(hsv, lower1, upper1),
+                cv2.inRange(hsv, lower2, upper2)
+            )
+            # Additional RGB verification for red
+            b, g, r = cv2.split(bgr)
+            rgb_mask = (r >= 70) & (r > g + 25) & (r > b + 25)
+            return cv2.bitwise_and(hsv_mask, rgb_mask.astype(np.uint8) * 255)
+        
+        elif color == 'blue':
+            lower = np.array([100, 100, 40])
+            upper = np.array([130, 255, 255])
+            hsv_mask = cv2.inRange(hsv, lower, upper)
+            # Additional RGB verification for blue
+            b, g, r = cv2.split(bgr)
+            rgb_mask = (b >= 60) & (b > r + 20) & (b > g + 10)
+            return cv2.bitwise_and(hsv_mask, rgb_mask.astype(np.uint8) * 255)
+        
+        return np.zeros(hsv.shape[:2], dtype=np.uint8)
 
-        stable = False
-        if self.prev_raw_obs is not None and obs.color == self.prev_raw_obs.color:
-            raw_jump = abs(obs.cx - self.prev_raw_obs.cx)
-            area_ratio = obs.area / max(self.prev_raw_obs.area, 1.0)
-            if raw_jump <= self.MAX_RAW_JUMP_PX and 0.35 <= area_ratio <= 2.8:
-                stable = True
-
-        if stable:
-            self.target_seen_frames += 1
-        else:
-            self.target_seen_frames = 1
-        self.prev_raw_obs = obs
-
-        alpha = 0.72
-        if self.filtered_cx is None or self.last_target_color != obs.color or not stable:
-            self.filtered_cx = obs.cx
-            self.filtered_cy = obs.cy
-            self.filtered_pitch = obs.hole_pitch
-            self.filtered_diam = obs.hole_diam
-            self.filtered_bbox_h = float(obs.bbox_h)
-        else:
-            self.filtered_cx = alpha * self.filtered_cx + (1.0 - alpha) * obs.cx
-            self.filtered_cy = alpha * self.filtered_cy + (1.0 - alpha) * obs.cy
-            self.filtered_pitch = alpha * self.filtered_pitch + (1.0 - alpha) * obs.hole_pitch
-            self.filtered_diam = alpha * self.filtered_diam + (1.0 - alpha) * obs.hole_diam
-            self.filtered_bbox_h = alpha * self.filtered_bbox_h + (1.0 - alpha) * float(obs.bbox_h)
-
-        obs.cx = float(self.filtered_cx)
-        obs.cy = float(self.filtered_cy)
-        obs.hole_pitch = float(max(obs.hole_pitch, self.filtered_pitch))
-        obs.hole_diam = float(max(obs.hole_diam, self.filtered_diam))
-        obs.bbox_h = int(max(obs.bbox_h, round(self.filtered_bbox_h)))
-
-        self.target_visible = obs.area >= self.MIN_TRACK_AREA
-        self.target_obs = obs if self.target_visible else None
-        if not self.target_visible:
-            self.target_seen_frames = 0
-            return
-
-        self.last_target_seen_time = time.monotonic()
-        self.last_target_pitch = obs.hole_pitch
-        self.last_target_color = obs.color
-
-        err = obs.cx - self.image_width / 2.0
-        if abs(err) > 2.0:
-            self.last_target_dir = -1.0 if err > 0.0 else 1.0
-
-    def build_red_mask(self, hsv, bgr):
-        lower_red_1 = np.array([0, 95, 45])
-        upper_red_1 = np.array([11, 255, 255])
-        lower_red_2 = np.array([170, 95, 45])
-        upper_red_2 = np.array([180, 255, 255])
-        hsv_mask = cv2.bitwise_or(
-            cv2.inRange(hsv, lower_red_1, upper_red_1),
-            cv2.inRange(hsv, lower_red_2, upper_red_2),
-        )
-        b = bgr[:, :, 0]
-        g = bgr[:, :, 1]
-        r = bgr[:, :, 2]
-        rgb_mask = np.zeros_like(hsv_mask)
-        red_dom = (r >= 70) & (r > g + 28) & (r > b + 28)
-        rgb_mask[red_dom] = 255
-        return cv2.bitwise_and(hsv_mask, rgb_mask)
-
-    def build_blue_mask(self, hsv, bgr):
-        lower_blue = np.array([100, 95, 35])
-        upper_blue = np.array([128, 255, 255])
-        hsv_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-        b = bgr[:, :, 0]
-        g = bgr[:, :, 1]
-        r = bgr[:, :, 2]
-        rgb_mask = np.zeros_like(hsv_mask)
-        blue_dom = (b >= 60) & (b > r + 22) & (b > g + 12)
-        rgb_mask[blue_dom] = 255
-        return cv2.bitwise_and(hsv_mask, rgb_mask)
-
-    def color_signature(self, color, roi_bgr, roi_hsv, roi_mask):
-        pixels = roi_bgr[roi_mask > 0]
-        hsv_pixels = roi_hsv[roi_mask > 0]
+    def verify_color(self, color: str, roi_bgr: np.ndarray, roi_hsv: np.ndarray, mask: np.ndarray) -> Tuple[bool, float]:
+        """Verify color of detected region"""
+        pixels = roi_bgr[mask > 0]
+        hsv_pixels = roi_hsv[mask > 0]
+        
         if pixels.size == 0 or hsv_pixels.size == 0:
             return False, 0.0
-
+        
         mean_b, mean_g, mean_r = np.mean(pixels, axis=0)
         mean_h, mean_s, mean_v = np.mean(hsv_pixels, axis=0)
         hue = hsv_pixels[:, 0]
         sat = hsv_pixels[:, 1]
-
+        
         if color == 'blue':
-            hue_ratio = float(np.mean((hue >= 106) & (hue <= 124) & (sat >= 120)))
-            dom_rb = float(mean_b - mean_r)
-            dom_gb = float(mean_b - mean_g)
-            color_conf = 0.30 * float(mean_s) + 0.34 * dom_rb + 0.22 * dom_gb + 65.0 * hue_ratio
-            ok = (
-                hue_ratio >= 0.55
-                and mean_s >= 145.0
-                and mean_v >= 55.0
-                and mean_b >= 80.0
-                and dom_rb >= 48.0
-                and dom_gb >= 28.0
-            )
-            return ok, float(color_conf)
+            hue_ratio = np.mean((hue >= 100) & (hue <= 130) & (sat >= 100))
+            dom_rb = mean_b - mean_r
+            dom_gb = mean_b - mean_g
+            conf = 0.3 * mean_s + 0.35 * dom_rb + 0.2 * dom_gb + 50 * hue_ratio
+            ok = (hue_ratio >= 0.5 and mean_s >= 130 and mean_v >= 50 and 
+                  mean_b >= 70 and dom_rb >= 40 and dom_gb >= 20)
+            return ok, conf
+        
+        else:  # red
+            hue_ratio = np.mean(((hue <= 12) | (hue >= 168)) & (sat >= 100))
+            dom_br = mean_r - mean_b
+            dom_gr = mean_r - mean_g
+            conf = 0.3 * mean_s + 0.35 * dom_br + 0.2 * dom_gr + 50 * hue_ratio
+            ok = (hue_ratio >= 0.6 and mean_s >= 130 and mean_v >= 55 and 
+                  mean_r >= 80 and dom_br >= 45 and dom_gr >= 30)
+            return ok, conf
 
-        hue_ratio = float(np.mean(((hue <= 12) | (hue >= 168)) & (sat >= 120)))
-        dom_br = float(mean_r - mean_b)
-        dom_gr = float(mean_r - mean_g)
-        color_conf = 0.28 * float(mean_s) + 0.34 * dom_br + 0.22 * dom_gr + 65.0 * hue_ratio
-        ok = (
-            hue_ratio >= 0.70
-            and mean_s >= 145.0
-            and mean_v >= 60.0
-            and mean_r >= 90.0
-            and dom_br >= 52.0
-            and dom_gr >= 38.0
-        )
-        return ok, float(color_conf)
-
-    def detect_best_cube(self, frame):
+    def detect_cubes(self, frame: np.ndarray) -> List[ObsCube]:
+        """Detect cubes in camera frame"""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        color_masks = {
-            'red': self.build_red_mask(hsv, frame),
-            'blue': self.build_blue_mask(hsv, frame),
-        }
-
-        candidate_colors = ['red', 'blue'] if self.TARGET_COLOR == 'any' else [self.TARGET_COLOR]
-        best = None
-
-        for color in candidate_colors:
-            mask = color_masks[color]
+        
+        detected = []
+        
+        for color in ['red', 'blue']:
+            mask = self.build_color_mask(hsv, frame, color)
+            
+            # Morphological operations
             kernel = np.ones((5, 5), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
-
+            
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
             for contour in contours:
                 area = cv2.contourArea(contour)
                 if area < self.MIN_CONTOUR_AREA:
                     continue
-
+                
                 x, y, w, h = cv2.boundingRect(contour)
                 if w < self.MIN_BBOX_W or h < self.MIN_BBOX_H:
                     continue
-
+                
                 cy = y + h / 2.0
-                if self.image_height is not None and cy < self.image_height * self.MIN_CENTER_Y_RATIO:
+                if self.image_height and cy < self.image_height * self.MIN_CENTER_Y_RATIO:
                     continue
-
+                
                 aspect = w / float(h)
                 if aspect < self.MIN_ASPECT_RATIO or aspect > self.MAX_ASPECT_RATIO:
                     continue
-
-                bbox_area = float(w * h)
-                if bbox_area <= 1.0:
-                    continue
-
+                
+                # Shape analysis
                 hull = cv2.convexHull(contour)
                 hull_area = max(cv2.contourArea(hull), 1.0)
-                solidity = float(area / hull_area)
+                solidity = area / hull_area
                 if solidity < self.MIN_SOLIDITY:
                     continue
-
-                shifted = contour - np.array([[x, y]])
-                roi_color_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.drawContours(roi_color_mask, [shifted], -1, 255, thickness=-1)
-                fill_ratio = float(np.count_nonzero(roi_color_mask) / bbox_area)
+                
+                bbox_area = float(w * h)
+                fill_ratio = area / bbox_area
                 if fill_ratio < self.MIN_FILL_RATIO:
                     continue
-
-                extent = float(area / bbox_area)
+                
+                extent = area / bbox_area
                 if extent < self.MIN_EXTENT:
                     continue
-
-                peri = cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, 0.03 * peri, True)
-                if len(approx) < 4 or len(approx) > 10:
-                    continue
-
-                roi_gray = gray[y:y + h, x:x + w]
-                roi_hsv = hsv[y:y + h, x:x + w]
-                roi_bgr = frame[y:y + h, x:x + w]
-
-                color_ok, color_conf = self.color_signature(color, roi_bgr, roi_hsv, roi_color_mask)
+                
+                # Color verification
+                roi_gray = gray[y:y+h, x:x+w]
+                roi_hsv = hsv[y:y+h, x:x+w]
+                roi_bgr = frame[y:y+h, x:x+w]
+                
+                shifted = contour - np.array([[x, y]])
+                roi_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.drawContours(roi_mask, [shifted], -1, 255, thickness=-1)
+                
+                color_ok, color_conf = self.verify_color(color, roi_bgr, roi_hsv, roi_mask)
                 if not color_ok:
                     continue
-
-                holes, hole_pitch, hole_diam = self.detect_holes(roi_gray, roi_color_mask)
-
-                score = (
-                    1.80 * area
-                    + 420.0 * fill_ratio
-                    + 340.0 * extent
-                    + 260.0 * solidity
-                    + 7.0 * color_conf
-                    + 18.0 * min(holes, 8)
-                    + 2.0 * hole_pitch
-                )
-
-                obs = CubeObservation(
+                
+                # Score calculation
+                score = (1.5 * area + 300 * fill_ratio + 250 * extent + 
+                        200 * solidity + 5 * color_conf)
+                
+                obs = ObsCube(
                     color=color,
                     cx=float(x + w / 2.0),
                     cy=float(cy),
@@ -660,401 +393,317 @@ class TrackingCubeV3(Node):
                     bbox_y=int(y),
                     bbox_w=int(w),
                     bbox_h=int(h),
-                    holes=int(holes),
-                    hole_pitch=float(hole_pitch),
-                    hole_diam=float(hole_diam),
+                    holes=0,
+                    hole_pitch=0.0,
+                    hole_diam=0.0,
                     fill_ratio=float(fill_ratio),
                     extent=float(extent),
                     solidity=float(solidity),
                     score=float(score),
-                    color_conf=float(color_conf),
+                    color_conf=float(color_conf)
                 )
+                detected.append(obs)
+        
+        return detected
 
-                if best is None or obs.score > best.score:
-                    best = obs
+    def get_best_cube(self) -> Optional[ObsCube]:
+        """Get the highest scoring cube from current detections"""
+        if not self.current_cubes:
+            return None
+        return max(self.current_cubes, key=lambda c: c.score)
 
-        return best
+    def is_in_red_zone(self, angle: float) -> bool:
+        """Check if angle points to red zone (right side)"""
+        normalized = self.normalize_angle(angle)
+        return -math.pi/2 <= normalized <= math.pi/2
 
-    def detect_holes(self, gray_roi, color_mask_roi):
-        if gray_roi.size == 0 or color_mask_roi.size == 0:
-            return 0, 0.0, 0.0
+    def is_in_blue_zone(self, angle: float) -> bool:
+        """Check if angle points to blue zone (left side)"""
+        return not self.is_in_red_zone(angle)
 
-        inner_mask = cv2.erode(color_mask_roi, np.ones((5, 5), np.uint8), iterations=1)
-        valid_pixels = gray_roi[inner_mask > 0]
-        if valid_pixels.size < 30:
-            return 0, 0.0, 0.0
-
-        dark_threshold = int(np.clip(np.percentile(valid_pixels, 20), 18, 90))
-        dark_mask = cv2.inRange(gray_roi, 0, dark_threshold)
-        dark_mask = cv2.bitwise_and(dark_mask, inner_mask)
-        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
-        contours, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        mask_area = max(1.0, float(np.count_nonzero(inner_mask)))
-        pts = []
-        diams = []
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < max(7.0, 0.00028 * mask_area):
-                continue
-            if area > 0.024 * mask_area:
-                continue
-
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter <= 1e-6:
-                continue
-            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-            if circularity < 0.24:
-                continue
-
-            M = cv2.moments(cnt)
-            if M['m00'] == 0:
-                continue
-            cx = float(M['m10'] / M['m00'])
-            cy = float(M['m01'] / M['m00'])
-            pts.append((cx, cy))
-            diams.append(math.sqrt(4.0 * area / math.pi))
-
-        if not pts:
-            return 0, 0.0, 0.0
-
-        if len(pts) >= 2:
-            arr = np.array(pts, dtype=np.float32)
-            nn = []
-            for i in range(len(arr)):
-                d = np.linalg.norm(arr - arr[i], axis=1)
-                d = d[d > 1.0]
-                if d.size > 0:
-                    nn.append(float(np.min(d)))
-            hole_pitch = float(np.median(nn)) if nn else 0.0
+    def add_cube_observation(self, cube: ObsCube):
+        """Add cube to appropriate list based on zone correctness"""
+        # Estimate distance based on cube size in image
+        if self.image_height:
+            distance_est = 2.0 * (1.0 - cube.bbox_h / self.image_height)
         else:
-            hole_pitch = 0.0
-
-        hole_diam = float(np.median(diams)) if diams else 0.0
-        return len(pts), hole_pitch, hole_diam
-
-    def handle_search_sweep(self):
-        # Check for confirmed target (now includes wrong-zone check)
-        if self.target_confirmed():
-            self.stop_robot_once()
-            zone_name = '红区' if self.get_zone_at_position(self.local_x, self.local_y) == Zone.RED else '蓝区'
-            self.set_state('ALIGN_TARGET', 
-                          f'发现错误方块: {self.target_obs.color} 方块在{zone_name}，开始对准')
-            return
-
-        delta = self.normalize_angle(self.local_yaw - self.search_prev_yaw)
-        self.search_accum_yaw += abs(delta)
-        self.search_prev_yaw = self.local_yaw
-
-        if self.search_accum_yaw >= 2.0 * math.pi - self.SEARCH_DONE_TOL:
-            self.stop_robot_once()
-            self.set_state('PATROL_FORWARD', '一圈未发现错误方块，进入巡航')
-            return
-
-        self.publish_cmd(0.0, self.SEARCH_ANG)
-
-    def handle_align_target(self):
-        if self.USE_ROI_ALIGNMENT:
-            self.handle_align_target_roi()
+            distance_est = 1.0
+        
+        # Calculate absolute angle of cube relative to initial orientation
+        absolute_angle = self.normalize_angle(self.local_yaw)
+        
+        cube_info = CubeInfo(
+            color=cube.color,
+            angle=absolute_angle,
+            distance=distance_est,
+            cx=cube.cx,
+            cy=cube.cy,
+            area=cube.area,
+            bbox_w=cube.bbox_w,
+            bbox_h=cube.bbox_h
+        )
+        
+        # Check if cube is in correct zone
+        in_red_zone = self.is_in_red_zone(absolute_angle)
+        
+        if (cube.color == 'red' and in_red_zone) or (cube.color == 'blue' and not in_red_zone):
+            self.correct_cubes.append(cube_info)
+            print(f'[FOUND] Correct {cube.color} cube at {math.degrees(absolute_angle):.1f}°')
         else:
-            self.handle_align_target_pixel()
+            self.wrong_cubes.append(cube_info)
+            print(f'[FOUND] Wrong {cube.color} cube at {math.degrees(absolute_angle):.1f}° - Needs relocation')
 
-    def handle_align_target_roi(self):
-        # Emergency safety check
-        if self.front_dist <= self.EMERGENCY_STOP_DIST:
-            self.request_shutdown('前方过近，紧急停车')
+    def handle_init(self):
+        """Initialize arena dimensions using LiDAR"""
+        if not self.has_scan or not self.has_odom:
+            print('[INIT] Waiting for sensor data...')
             return
+        
+        # Measure arena dimensions
+        total_dist = self.front_dist + self.back_dist
+        total_width = self.left_dist + self.right_dist
+        
+        self.arena_length = total_dist
+        self.arena_width = total_width
+        self.arena_center = np.array([self.local_x, self.local_y])
+        
+        print(f'[INIT] Arena dimensions: Length={self.arena_length:.2f}m, Width={self.arena_width:.2f}m')
+        print(f'[INIT] Robot positioned at center (0, 0)')
+        print(f'[INIT] Arena boundaries: X=±{self.arena_length/2:.2f}m, Y=±{self.arena_width/2:.2f}m')
+        
+        self.set_state('IDLE')
 
-        # Target not visible
-        if not self.target_visible or self.target_obs is None or self.image_width is None:
-            if self.target_recently_seen():
-                self.publish_cmd(0.0, self.last_target_dir * self.RECOVER_ANG)
+    def handle_idle(self):
+        """Stay stationary waiting for commands"""
+        self.stop_robot()
+
+    def handle_search(self):
+        """Perform 360° rotation to find cubes"""
+        if not self.has_odom:
+            return
+        
+        # Start the search rotation
+        if self.prev_state != 'SEARCH':
+            self.search_start_yaw = self.local_yaw
+            self.search_rotated = 0.0
+            self.correct_cubes.clear()
+            self.wrong_cubes.clear()
+            print('[SEARCH] Starting full rotation scan...')
+        
+        # Rotate the robot
+        self.publish_cmd(0.0, self.ROTATION_SPEED)
+        
+        # Track rotation progress
+        delta_yaw = self.normalize_angle(self.local_yaw - self.search_start_yaw)
+        self.search_rotated += abs(self.normalize_angle(delta_yaw - (self.search_rotated - self.search_rotated)))
+        
+        # Check for cubes during rotation
+        best_cube = self.get_best_cube()
+        if best_cube and best_cube.area > 800:  # Only record if cube is clearly visible
+            # Check if we haven't already recorded this cube
+            current_angle = self.normalize_angle(self.local_yaw)
+            already_recorded = False
+            
+            for cube in self.correct_cubes + self.wrong_cubes:
+                angle_diff = abs(self.normalize_angle(cube.angle - current_angle))
+                if angle_diff < 0.1:  # Within ~6 degrees
+                    already_recorded = True
+                    break
+            
+            if not already_recorded:
+                self.add_cube_observation(best_cube)
+        
+        # Check if full rotation is complete
+        if abs(delta_yaw) < 0.05 and self.prev_state != 'SEARCH':
+            # We've completed nearly a full rotation back to start
+            if self.search_rotated > math.pi * 1.8:  # At least 324 degrees
+                self.stop_robot()
+                
+                if not self.wrong_cubes:
+                    print('[SEARCH] All cubes are in the correct zones!')
+                    self.set_state('IDLE')
+                else:
+                    print(f'[SEARCH] Found {len(self.wrong_cubes)} cubes in wrong zones')
+                    self.target_cube = self.wrong_cubes[0]
+                    print(f'[SEARCH] Approaching {self.target_cube.color} cube at {math.degrees(self.target_cube.angle):.1f}°')
+                    self.set_state('APPROACH')
+        
+        self.prev_state = self.state
+
+    def check_wall_proximity(self) -> bool:
+        """Check if robot is too close to any wall"""
+        if not self.has_scan:
+            return False
+        
+        # Check all directions
+        if self.front_dist < self.WALL_SAFE_DIST:
+            print(f'[WARNING] Front wall too close: {self.front_dist:.2f}m')
+            return True
+        if self.back_dist < self.WALL_SAFE_DIST:
+            print(f'[WARNING] Back wall too close: {self.back_dist:.2f}m')
+            return True
+        if self.left_dist < self.WALL_SAFE_DIST:
+            print(f'[WARNING] Left wall too close: {self.left_dist:.2f}m')
+            return True
+        if self.right_dist < self.WALL_SAFE_DIST:
+            print(f'[WARNING] Right wall too close: {self.right_dist:.2f}m')
+            return True
+        
+        return False
+
+    def handle_approach(self):
+        """Navigate towards the target cube"""
+        if not self.target_cube or not self.has_odom:
+            self.set_state('IDLE')
+            return
+        
+        # Check wall proximity
+        if self.check_wall_proximity():
+            print('[APPROACH] Too close to wall, adjusting...')
+            self.stop_robot()
+            # Back up slightly
+            self.publish_cmd(-0.05, 0.0)
+            time.sleep(0.5)
+            self.stop_robot()
+        
+        # Check if we can see the cube
+        best_cube = self.get_best_cube()
+        
+        if best_cube and best_cube.area > 500:
+            # Cube is visible - align and approach
+            if self.image_width is None:
                 return
-            self.stop_robot_once()
-            self.set_state('SEARCH_SWEEP', '目标丢失，重新搜索')
-            return
-
-        # Define ROI parameters
-        roi_size = self.ROI_SIZE
-        roi_left = (self.image_width - roi_size) // 2
-        roi_right = roi_left + roi_size
-        roi_top = (self.image_height - roi_size) // 2
-        roi_bottom = roi_top + roi_size
-
-        # Get cube bounding box
-        cube = self.target_obs
-        cube_left = cube.bbox_x
-        cube_right = cube.bbox_x + cube.bbox_w
-        cube_top = cube.bbox_y
-        cube_bottom = cube.bbox_y + cube.bbox_h
-
-        # Check if cube is fully contained in ROI
-        is_contained = (cube_left >= roi_left and 
-                        cube_right <= roi_right and
-                        cube_top >= roi_top and 
-                        cube_bottom <= roi_bottom)
-
-        if is_contained:
-            if self.target_seen_frames >= self.CENTER_HOLD_FRAMES:
-                self.stop_robot_once()
-                self.set_state('APPROACH_TARGET', f'{cube.color} 方块已对正，开始前进')
-                return
-            self.stop_robot_once()
-            return
-
-        # Determine which direction to turn
-        cube_center_x = cube.cx
-        roi_center_x = roi_left + roi_size // 2
-
-        if cube_center_x < roi_center_x:
-            direction = 1.0
-            error_pixels = roi_center_x - cube_center_x
-        else:
-            direction = -1.0
-            error_pixels = cube_center_x - roi_center_x
-
-        error_norm = error_pixels / (self.image_width / 2.0)
-        angular = self.clamp_abs(direction * 0.30 * error_norm, 
-                                self.ALIGN_MIN_ANG, 
-                                self.ALIGN_MAX_ANG)
-
-        self.publish_cmd(0.0, angular)
-
-    def handle_align_target_pixel(self):
-        if self.front_dist <= self.EMERGENCY_STOP_DIST:
-            self.request_shutdown('前方过近，紧急停车')
-            return
-
-        if not self.target_visible or self.target_obs is None or self.image_width is None:
-            if self.target_recently_seen():
-                self.publish_cmd(0.0, self.last_target_dir * self.RECOVER_ANG)
-                return
-            self.stop_robot_once()
-            self.set_state('SEARCH_SWEEP', '目标丢失，重新搜索')
-            return
-
-        center_x = self.image_width / 2.0
-        error = self.target_obs.cx - center_x
-        error_norm = error / center_x
-
-        if abs(error) <= self.ALIGN_PIXEL_TOL:
-            if self.target_seen_frames >= self.CENTER_HOLD_FRAMES:
-                self.stop_robot_once()
-                self.set_state('APPROACH_TARGET', f'{self.target_obs.color} 方块已对正，开始前进')
-                return
-            self.stop_robot_once()
-            return
-
-        angular = self.clamp_abs(-0.30 * error_norm, self.ALIGN_MIN_ANG, self.ALIGN_MAX_ANG)
-        self.publish_cmd(0.0, angular)
-
-    def handle_approach_target(self):
-        if self.front_dist <= self.EMERGENCY_STOP_DIST:
-            self.request_shutdown('前方过近，紧急停车')
-            return
-
-        if not self.target_visible or self.target_obs is None or self.image_width is None:
-            if self.target_recently_seen():
-                self.publish_cmd(0.0, self.last_target_dir * self.RECOVER_ANG)
-                return
-            if self.last_target_pitch >= self.STOP_HOLE_PITCH_PX * 0.92:
-                self.request_shutdown('目标已到达近距离，停车')
+            
+            # Calculate pixel error from center
+            center_x = self.image_width / 2.0
+            pixel_error = best_cube.cx - center_x
+            
+            # Check if aligned
+            if abs(pixel_error) < self.PIXEL_ALIGN_TOL:
+                # Aligned - move forward
+                if best_cube.area > 50000:  # Very close
+                    print(f'[APPROACH] Reached {self.target_cube.color} cube!')
+                    self.stop_robot()
+                    # Remove this cube from wrong_cubes
+                    if self.wrong_cubes:
+                        self.wrong_cubes.pop(0)
+                    
+                    # Check if more cubes need processing
+                    if self.wrong_cubes:
+                        self.target_cube = self.wrong_cubes[0]
+                        print(f'[APPROACH] Next target: {self.target_cube.color} cube')
+                    else:
+                        print('[APPROACH] All wrong cubes processed - Returning to center')
+                        self.set_state('RETURN_TO_CENTER')
+                else:
+                    # Move forward slowly
+                    self.publish_cmd(self.FORWARD_SPEED, 0.0)
             else:
-                self.stop_robot_once()
-                self.set_state('SEARCH_SWEEP', '前进时丢失目标，重新搜索')
-            return
-
-        error = self.target_error_pixels()
-        center_x = self.image_width / 2.0
-        error_norm = error / center_x
-
-        if self.target_close_enough():
-            self.request_shutdown(
-                f'到达 {self.target_obs.color} 方块前方，holes={self.target_obs.holes} pitch={self.target_obs.hole_pitch:.1f}'
-            )
-            return
-
-        if abs(error) >= self.REACQUIRE_PIXEL_TOL:
-            self.stop_robot_once()
-            self.set_state('ALIGN_TARGET', '偏差过大，先重新对准')
-            return
-
-        if abs(error) > self.APPROACH_ROTATE_ONLY_PX:
-            angular = self.clamp_abs(-0.32 * error_norm, self.ALIGN_MIN_ANG, self.ALIGN_MAX_ANG)
-            self.publish_cmd(0.0, angular)
-            return
-
-        if self.target_obs.hole_pitch >= self.SLOW_HOLE_PITCH_PX or abs(error) > self.ALIGN_PIXEL_TOL * 1.7:
-            linear = self.APPROACH_SLOW_SPEED
+                # Need to rotate to align
+                angle_correction = -0.5 * (pixel_error / center_x)
+                angular_speed = max(-self.ALIGN_ROTATION_SPEED, 
+                                  min(self.ALIGN_ROTATION_SPEED, angle_correction))
+                self.publish_cmd(0.0, angular_speed)
         else:
-            linear = self.APPROACH_FAST_SPEED
+            # Cube not visible - rotate to last known angle
+            if self.target_cube:
+                angle_error = self.normalize_angle(self.target_cube.angle - self.local_yaw)
+                if abs(angle_error) < self.ANGLE_ARRIVAL_TOL:
+                    # At correct angle but no cube - move forward slowly
+                    self.publish_cmd(self.FORWARD_SPEED * 0.5, 0.0)
+                else:
+                    # Rotate towards target
+                    angular_speed = max(-self.ALIGN_ROTATION_SPEED,
+                                      min(self.ALIGN_ROTATION_SPEED, 2.0 * angle_error))
+                    self.publish_cmd(0.0, angular_speed)
+            else:
+                self.set_state('IDLE')
 
-        if abs(error) <= self.ALIGN_PIXEL_TOL:
-            angular = 0.0
+    def handle_return_to_center(self):
+        """Return to the initial position (0, 0)"""
+        if not self.has_odom:
+            return
+        
+        # Calculate vector to center
+        dx = -self.local_x  # Want to reach x=0
+        dy = -self.local_y  # Want to reach y=0
+        dist_to_center = math.sqrt(dx**2 + dy**2)
+        
+        if dist_to_center < self.CENTER_ARRIVAL_TOL:
+            print('[RETURN] Reached center position')
+            self.stop_robot()
+            self.set_state('IDLE')
+            return
+        
+        # Calculate angle to center
+        target_angle = math.atan2(dy, dx)
+        angle_error = self.normalize_angle(target_angle - self.local_yaw)
+        
+        # Check wall proximity during return
+        if self.check_wall_proximity():
+            print('[RETURN] Wall proximity warning - Adjusting path')
+            self.stop_robot()
+        
+        # Align with center direction first
+        if abs(angle_error) > self.ANGLE_ARRIVAL_TOL:
+            angular_speed = max(-self.ALIGN_ROTATION_SPEED,
+                              min(self.ALIGN_ROTATION_SPEED, 2.0 * angle_error))
+            self.publish_cmd(0.0, angular_speed)
         else:
-            angular = self.clamp_abs(-0.24 * error_norm, 0.02, 0.10)
-
-        self.publish_cmd(linear, angular)
-
-    def handle_patrol_forward(self):
-        if self.target_confirmed():
-            self.stop_robot_once()
-            zone_name = '红区' if self.get_zone_at_position(self.local_x, self.local_y) == Zone.RED else '蓝区'
-            self.set_state('ALIGN_TARGET', 
-                          f'巡航时发现错误方块: {self.target_obs.color} 方块在{zone_name}，开始对准')
-            return
-
-        progress = self.current_progress_along_segment()
-        if self.front_dist <= self.WALL_STOP_DIST:
-            self.stop_robot_once()
-            self.segment_length = max(0.0, progress)
-            self.segment_mid_progress = 0.5 * self.segment_length
-            self.set_state('RETURN_TO_MIDPOINT', '前方接近边界，返回中点')
-            return
-
-        self.publish_cmd(self.PATROL_SPEED, 0.0)
-
-    def handle_return_to_midpoint(self):
-        if self.target_confirmed():
-            self.stop_robot_once()
-            zone_name = '红区' if self.get_zone_at_position(self.local_x, self.local_y) == Zone.RED else '蓝区'
-            self.set_state('ALIGN_TARGET', 
-                          f'后退时发现错误方块: {self.target_obs.color} 方块在{zone_name}，开始对准')
-            return
-
-        progress = self.current_progress_along_segment()
-        if progress <= self.segment_mid_progress + self.MIDPOINT_TOL:
-            self.stop_robot_once()
-            self.set_state('TURN_LEFT_90', '回到中点，左转 90 度')
-            return
-
-        self.publish_cmd(self.BACKWARD_SPEED, 0.0)
-
-    def handle_turn_left_90(self):
-        if self.target_confirmed():
-            self.stop_robot_once()
-            zone_name = '红区' if self.get_zone_at_position(self.local_x, self.local_y) == Zone.RED else '蓝区'
-            self.set_state('ALIGN_TARGET', 
-                          f'转弯时发现错误方块: {self.target_obs.color} 方块在{zone_name}，开始对准')
-            return
-
-        error = self.normalize_angle(self.turn_target_yaw - self.local_yaw)
-        if abs(error) <= self.TURN_YAW_TOL:
-            self.stop_robot_once()
-            self.set_state('PATROL_FORWARD', '转弯完成，继续巡航')
-            return
-
-        angular = self.clamp_abs(0.75 * error, self.TURN_MIN_ANG, self.TURN_MAX_ANG)
-        self.publish_cmd(0.0, angular)
+            # Move towards center
+            speed = min(self.FORWARD_SPEED, dist_to_center)
+            self.publish_cmd(speed, 0.0)
 
     def control_loop(self):
-        if self.shutdown_requested:
-            self.stop_robot_once()
-            self.shutdown_count += 1
-            if self.shutdown_count >= 8:
-                try:
-                    self.stop_robot_reliable(repeat=15, delay=0.03)
-                except Exception:
-                    pass
-                rclpy.shutdown()
+        """Main control loop"""
+        if not self.has_scan or not self.has_odom:
             return
-
-        if not self.ready():
-            self.stop_robot_once()
-            return
-
-        if self.state == 'IDLE':
-            self.stop_robot_once()
-            return
-
-        if self.state == 'SEARCH_SWEEP':
-            self.handle_search_sweep()
-        elif self.state == 'ALIGN_TARGET':
-            self.handle_align_target()
-        elif self.state == 'APPROACH_TARGET':
-            self.handle_approach_target()
-        elif self.state == 'PATROL_FORWARD':
-            self.handle_patrol_forward()
-        elif self.state == 'RETURN_TO_MIDPOINT':
-            self.handle_return_to_midpoint()
-        elif self.state == 'TURN_LEFT_90':
-            self.handle_turn_left_90()
-        else:
-            self.stop_robot_once()
+        
+        # Execute current state
+        if self.state == 'INIT':
+            self.handle_init()
+        elif self.state == 'IDLE':
+            self.handle_idle()
+        elif self.state == 'SEARCH':
+            self.handle_search()
+        elif self.state == 'APPROACH':
+            self.handle_approach()
+        elif self.state == 'RETURN_TO_CENTER':
+            self.handle_return_to_center()
 
     def status_loop(self):
-        if not self.ready():
-            wait_now = (self.has_scan, self.has_odom, self.has_image)
-            if wait_now != self.wait_status_last:
-                print(f'[WAIT] scan={self.has_scan} odom={self.has_odom} image={self.has_image}')
-                self.wait_status_last = wait_now
+        """Periodic status reporting"""
+        if not self.has_odom:
             return
-
-        if self.shutdown_requested:
-            print(f'[STATUS] stopping | reason={self.shutdown_reason}')
-            return
-
-        zone_info = ''
-        if self.origin_set:
-            current_zone = self.get_zone_at_position(self.local_x, self.local_y)
-            zone_info = f' zone={current_zone.value} pos=({self.local_x:.2f},{self.local_y:.2f})'
-
-        if self.target_visible and self.target_obs is not None:
-            wrong_zone_flag = ''
-            if self.origin_set:
-                if self.is_cube_in_wrong_zone(self.target_obs.color):
-                    wrong_zone_flag = ' [WRONG ZONE]'
-                else:
-                    wrong_zone_flag = ' [OK ZONE]'
-            print(
-                f'[STATUS] {self.state} '
-                f'color={self.target_obs.color}{wrong_zone_flag} '
-                f'err={self.target_error_pixels():.0f} '
-                f'area={self.target_obs.area:.0f} '
-                f'holes={self.target_obs.holes} '
-                f'pitch={self.target_obs.hole_pitch:.1f} '
-                f'conf={self.target_obs.color_conf:.0f} '
-                f'front={self.front_dist:.2f}{zone_info}'
-            )
+        
+        position = f'X={self.local_x:.2f} Y={self.local_y:.2f} Yaw={math.degrees(self.local_yaw):.1f}°'
+        
+        if self.state == 'SEARCH':
+            print(f'[STATUS] {self.state} | {position} | Correct: {len(self.correct_cubes)} Wrong: {len(self.wrong_cubes)}')
+        elif self.state == 'APPROACH' and self.target_cube:
+            print(f'[STATUS] {self.state} | {position} | Target: {self.target_cube.color} cube')
         else:
-            print(f'[STATUS] {self.state} color=none front={self.front_dist:.2f}{zone_info}')
+            print(f'[STATUS] {self.state} | {position}')
 
     def destroy_node(self):
-        try:
-            self.stop_robot_reliable(repeat=15, delay=0.03)
-        except Exception:
-            pass
+        """Clean shutdown"""
+        self.stop_robot()
         super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TrackingCubeV3()
-
+    node = CubeSorter()
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print('[STOP] KeyboardInterrupt，停车退出')
-        try:
-            node.stop_robot_reliable(repeat=15, delay=0.03)
-        except Exception:
-            pass
+        print('[SYSTEM] Shutdown requested')
+        node.stop_robot()
     finally:
-        try:
-            node.stop_robot_reliable(repeat=15, delay=0.03)
-        except Exception:
-            pass
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
-        try:
-            if rclpy.ok():
-                rclpy.shutdown()
-        except Exception:
-            pass
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
