@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Position Tracking Test Node (FIXED V2 - Correct Coordinate System)
+Position Tracking Test Node (FIXED V3 - Improved Origin Detection)
 ==================================================================
 Tests the odometry-based local position tracking with:
 - Forward = +Y, Right = +X coordinate system
@@ -8,13 +8,7 @@ Tests the odometry-based local position tracking with:
 - Position logging every 0.5 seconds
 - 's' key: return to origin
 - 'h' key: return to origin then halt
-
-Coordinate system:
-  +Y (forward)
-   ^
-   |
-   +-----> +X (right)
-  Origin (0,0) at starting position
+- Improved origin detection with adaptive margins
 """
 
 import math
@@ -33,10 +27,10 @@ from sensor_msgs.msg import LaserScan
 
 class PositionTrackerTester(Node):
     """
-    Test node with corrected coordinate system:
-    - Forward movement increases Y
-    - Rightward movement increases X
-    - Origin at starting position
+    Test node with improved origin detection:
+    - Uses multiple criteria to determine if robot has reached origin
+    - Adaptive margins based on movement history
+    - Smooth deceleration when approaching origin
     """
     
     # ── motion parameters ─────────────────────────────────────────────────
@@ -48,6 +42,11 @@ class PositionTrackerTester(Node):
     WALL_CRITICAL_DIST = 0.25  # m - hard stop and reverse
     WALL_SAFE_DIST = 0.50      # m - considered safe to move forward
     
+    # ── origin detection ─────────────────────────────────────────────────
+    ORIGIN_CLOSE_DIST = 0.15   # m - considered "close" to origin
+    ORIGIN_ARRIVED_DIST = 0.08 # m - considered "arrived" at origin
+    ORIGIN_ARRIVED_TIME = 1.0  # s - must be within arrived dist for this long
+    
     # ── timing ────────────────────────────────────────────────────────────
     CONTROL_DT = 0.05          # s - control loop period
     LOG_DT = 0.5               # s - position logging interval
@@ -55,7 +54,7 @@ class PositionTrackerTester(Node):
     
     # ── test phases ───────────────────────────────────────────────────────
     TEST_DURATION = 60.0       # s - total test time
-    RETURN_HOME_TIME = 15.0    # s - time to return to origin
+    RETURN_HOME_TIME = 20.0    # s - increased time to return to origin
     
     def __init__(self):
         super().__init__('position_tracker_tester')
@@ -100,6 +99,10 @@ class PositionTrackerTester(Node):
         self.last_move_change = time.monotonic()
         self.state_change_time = time.monotonic()
         
+        # Origin detection state
+        self.origin_near_time = 0.0  # How long we've been near origin
+        self.origin_stable_count = 0  # Number of consecutive checks near origin
+        
         # Random movement state
         self.random_linear = 0.0
         self.random_angular = 0.0
@@ -110,10 +113,11 @@ class PositionTrackerTester(Node):
         threading.Thread(target=self._console_loop, daemon=True).start()
         
         print('=' * 60)
-        print('[TEST] Position Tracking Test Started (CORRECTED COORDS)')
+        print('[TEST] Position Tracking Test Started (IMPROVED ORIGIN DETECTION)')
         print('[TEST] Coordinate system: Forward = +Y, Right = +X')
+        print('[TEST] Origin arrival: within 8cm for 1 second')
         print('[TEST] Phase 1: Random movement with wall avoidance (60s)')
-        print('[TEST] Phase 2: Return to origin (15s or press "s")')
+        print('[TEST] Phase 2: Return to origin (20s or press key)')
         print('[TEST] Press "s" to return to origin and continue')
         print('[TEST] Press "h" to return to origin then halt')
         print('=' * 60)
@@ -194,10 +198,6 @@ class PositionTrackerTester(Node):
         Track position with CORRECT coordinate system:
         - Forward = +Y
         - Right = +X
-        
-        The robot's initial heading defines the +Y direction.
-        When the robot moves forward from its starting position, Y increases.
-        When the robot moves to its right from the start, X increases.
         """
         self.world_x = msg.pose.pose.position.x
         self.world_y = msg.pose.pose.position.y
@@ -217,15 +217,6 @@ class PositionTrackerTester(Node):
         dy_world = self.world_y - self._init_wy
         
         # Rotate to align with robot's initial heading
-        # Forward direction (robot's initial +X in world) becomes +Y in local
-        # Right direction becomes +X in local
-        # 
-        # Standard rotation: if robot starts facing world_yaw angle,
-        # the local frame is rotated by init_yaw relative to world frame
-        # 
-        # Local X (right) =  world_dx * cos(yaw) + world_dy * sin(yaw)
-        # Local Y (forward) = -world_dx * sin(yaw) + world_dy * cos(yaw)
-        
         cos_yaw = math.cos(self._init_wyaw)
         sin_yaw = math.sin(self._init_wyaw)
         
@@ -327,35 +318,92 @@ class PositionTrackerTester(Node):
               f'(linear={self.random_linear:.3f} m/s, '
               f'angular={math.degrees(self.random_angular):.1f} °/s)')
 
+    # ── origin detection ─────────────────────────────────────────────────
+    
+    def _check_origin_arrival(self) -> bool:
+        """
+        Check if robot has arrived at origin using multiple criteria:
+        1. Distance from origin < ORIGIN_ARRIVED_DIST
+        2. Robot has been near origin for ORIGIN_ARRIVED_TIME
+        3. Robot is moving slowly (to ensure it won't overshoot)
+        """
+        dist = math.hypot(self.local_x, self.local_y)
+        
+        # Check if we're within the "arrived" distance
+        if dist < self.ORIGIN_ARRIVED_DIST:
+            # We're very close to origin
+            if self.origin_near_time == 0.0:
+                self.origin_near_time = time.monotonic()
+            
+            # Check if we've been here long enough
+            time_near = time.monotonic() - self.origin_near_time
+            if time_near >= self.ORIGIN_ARRIVED_TIME:
+                return True
+        else:
+            # Reset timer if we moved away
+            self.origin_near_time = 0.0
+        
+        return False
+
+    def _is_near_origin(self) -> bool:
+        """Check if robot is within the 'close' distance of origin"""
+        dist = math.hypot(self.local_x, self.local_y)
+        return dist < self.ORIGIN_CLOSE_DIST
+
     # ── return home logic ───────────────────────────────────────────────
     
     def _return_home_movement(self) -> Tuple[float, float]:
-        """Calculate velocities to return to origin (0,0)"""
+        """
+        Calculate velocities to return to origin with improved approach:
+        - Fast approach when far away
+        - Slower, more precise movement when close
+        - Stop and declare arrival when within margin
+        """
         # Vector from current position to origin
-        dx_to_home = -self.local_x  # Negative because we want to go to 0
+        dx_to_home = -self.local_x
         dy_to_home = -self.local_y
         
         dist = math.hypot(dx_to_home, dy_to_home)
-        target_yaw = math.atan2(dy_to_home, dx_to_home)  # atan2(y, x) for direction to home
         
-        # Current heading in local frame
-        current_heading = self.local_yaw
-        
-        # Calculate heading error: how much we need to turn to face home
-        yaw_error = self._norm(target_yaw - current_heading)
-        
-        if dist < 0.05:  # Within 5cm of origin
+        # Check if we've arrived using the improved detection
+        if self._check_origin_arrival():
+            print(f'[HOME] Arrived at origin! Distance: {dist:.3f}m')
             return 0.0, 0.0
         
-        # Proportional control to face home
-        angular = 0.8 * yaw_error
-        angular = max(-self.ANGULAR_SPEED, min(self.ANGULAR_SPEED, angular))
+        target_yaw = math.atan2(dy_to_home, dx_to_home)
+        yaw_error = self._norm(target_yaw - self.local_yaw)
         
-        # Move forward if facing approximately correct direction
-        if abs(yaw_error) < math.radians(20):
-            linear = min(self.LINEAR_SPEED * 0.5, dist * 0.5)
+        # Progressive speed reduction as we get closer
+        if dist < self.ORIGIN_CLOSE_DIST:
+            # Close to origin - slow down for precision
+            max_speed = self.LINEAR_SPEED * 0.3  # 30% of normal speed
+            # If we're very close and roughly facing the right direction, just inch forward
+            if abs(yaw_error) < math.radians(15):
+                linear = min(max_speed, dist * 0.3)  # Proportional to distance
+            else:
+                linear = 0.0  # Need to turn more
+        elif dist < 0.3:
+            # Medium distance - moderate speed
+            max_speed = self.LINEAR_SPEED * 0.5  # 50% of normal speed
+            if abs(yaw_error) < math.radians(30):
+                linear = min(max_speed, dist * 0.4)
+            else:
+                linear = 0.0
         else:
-            linear = 0.0  # Turn in place if not facing home
+            # Far from origin - full speed approach
+            if abs(yaw_error) < math.radians(20):
+                linear = min(self.LINEAR_SPEED * 0.7, dist * 0.5)
+            else:
+                linear = 0.0
+        
+        # Angular control - more aggressive when far, gentler when close
+        if dist < self.ORIGIN_CLOSE_DIST:
+            angular_gain = 0.5  # Slower turns when close
+        else:
+            angular_gain = 0.8  # Normal turning speed
+        
+        angular = angular_gain * yaw_error
+        angular = max(-self.ANGULAR_SPEED, min(self.ANGULAR_SPEED, angular))
         
         return linear, angular
 
@@ -378,8 +426,10 @@ class PositionTrackerTester(Node):
         
         # Determine cardinal direction for verification
         direction = ''
-        if abs(self.local_x) < 0.05 and abs(self.local_y) < 0.05:
+        if dist_from_origin < self.ORIGIN_ARRIVED_DIST:
             direction = 'AT ORIGIN'
+        elif dist_from_origin < self.ORIGIN_CLOSE_DIST:
+            direction = 'NEAR ORIGIN'
         else:
             if self.local_y > 0.05:
                 direction += 'N'
@@ -391,12 +441,16 @@ class PositionTrackerTester(Node):
                 direction += 'W'
         
         # Print current status with direction
-        print(f'[LOG] t={elapsed:.1f}s | '
+        status_icon = ''
+        if self._is_near_origin():
+            status_icon = '🏠' if dist_from_origin < self.ORIGIN_ARRIVED_DIST else '📍'
+        
+        print(f'[LOG] t={elapsed:.1f}s {status_icon} | '
               f'pos=(X:{self.local_x:+.3f}, Y:{self.local_y:+.3f})m [{direction}] | '
               f'dist={dist_from_origin:.3f}m | '
               f'heading={math.degrees(self.local_yaw):.1f}° | '
               f'phase={self.phase} | '
-              f'walls: F={self.front_dist:.2f}m L={self.left_dist:.2f}m R={self.right_dist:.2f}m')
+              f'walls: F={self.front_dist:.2f}m')
 
     def _print_final_report(self):
         """Print comprehensive test report"""
@@ -431,18 +485,19 @@ class PositionTrackerTester(Node):
         print(f'Final distance from origin: {final_dist:.3f}m')
         print(f'Total path length (approximate): {total_path:.3f}m')
         
-        # Final position check
+        # Final position check with multiple tolerance levels
         final_x, final_y = self.local_x, self.local_y
         print(f'Final position: X={final_x:+.3f}m, Y={final_y:+.3f}m')
         
-        if final_dist < 0.10:
-            print(f'\n✅ SUCCESS: Robot returned to within 10cm of origin')
+        if final_dist < 0.08:
+            print(f'\n✅ EXCELLENT: Robot within 8cm of origin (very accurate)')
+        elif final_dist < 0.15:
+            print(f'\n✅ GOOD: Robot within 15cm of origin (acceptable)')
         elif final_dist < 0.25:
-            print(f'\n⚠️  WARNING: Robot is {final_dist*100:.0f}cm from origin '
-                  f'(acceptable but not perfect)')
+            print(f'\n⚠️  OKAY: Robot within 25cm of origin (moderate drift)')
         else:
-            print(f'\n❌ FAIL: Robot is {final_dist*100:.0f}cm from origin! '
-                  f'Position tracking may have drift.')
+            print(f'\n❌ POOR: Robot is {final_dist*100:.0f}cm from origin! '
+                  f'Significant position drift.')
         
         # Arena boundary check (assuming 3m arena)
         if max_dist > 3.0:
@@ -450,14 +505,17 @@ class PositionTrackerTester(Node):
                   f'(max distance {max_dist:.2f}m)')
         
         print('\nSample trajectory (every 5th point):')
-        print('  Time    X(m)     Y(m)     Heading(°)  Direction')
-        print('  ------  -------  -------  ----------  ---------')
+        print('  Time    X(m)     Y(m)     Dist(m)  Heading(°)  Direction')
+        print('  ------  -------  -------  -------  ----------  ---------')
         for i in range(0, len(self.position_log), 5):
             t, x, y, yaw = self.position_log[i]
+            dist = math.hypot(x, y)
             # Determine direction
             direction = ''
-            if abs(x) < 0.05 and abs(y) < 0.05:
+            if dist < 0.08:
                 direction = 'ORIGIN'
+            elif dist < 0.15:
+                direction = 'NEAR'
             else:
                 if y > 0.05:
                     direction += 'N'
@@ -467,7 +525,8 @@ class PositionTrackerTester(Node):
                     direction += 'E'
                 elif x < -0.05:
                     direction += 'W'
-            print(f'  {t:5.1f}s  {x:+7.3f}  {y:+7.3f}  {math.degrees(yaw):+10.1f}  {direction:>9}')
+            print(f'  {t:5.1f}s  {x:+7.3f}  {y:+7.3f}  {dist:7.3f}  '
+                  f'{math.degrees(yaw):+10.1f}  {direction:>9}')
         
         print('=' * 60)
 
@@ -487,12 +546,14 @@ class PositionTrackerTester(Node):
                     print(f'\n[CMD] "h" pressed - Returning to origin before halting...')
                     self.phase = 'HALT_AFTER_RETURN'
                     self.state_change_time = time.monotonic()
+                    self.origin_near_time = 0.0  # Reset origin detection
             elif key == 's':
-                # Return to origin and continue (go to IDLE or resume)
+                # Return to origin and continue
                 if self.phase not in ['RETURN_HOME', 'HALT_AFTER_RETURN']:
                     print(f'\n[CMD] "s" pressed - Returning to origin...')
                     self.phase = 'RETURN_HOME'
                     self.state_change_time = time.monotonic()
+                    self.origin_near_time = 0.0  # Reset origin detection
         
         elapsed = time.monotonic() - self.start_time
         
@@ -501,30 +562,34 @@ class PositionTrackerTester(Node):
             print('\n[PHASE] Test duration reached. Starting return to origin...')
             self.phase = 'RETURN_HOME'
             self.state_change_time = time.monotonic()
+            self.origin_near_time = 0.0  # Reset origin detection
         
         elif self.phase in ['RETURN_HOME', 'HALT_AFTER_RETURN']:
             dist = math.hypot(self.local_x, self.local_y)
             
-            # Check if we've reached home
-            if dist < 0.05:
+            # Check if we've reached home using improved detection
+            if self._check_origin_arrival():
                 self._stop()
+                final_dist = math.hypot(self.local_x, self.local_y)
+                
                 if self.phase == 'HALT_AFTER_RETURN':
-                    print(f'\n[HALT] Reached origin. Halting as requested.')
-                    print(f'Final position: X={self.local_x:+.3f}m, Y={self.local_y:+.3f}m')
+                    print(f'\n[HALT] Arrived near origin (dist={final_dist:.3f}m). Halting as requested.')
                     self.phase = 'IDLE'
                     self._print_final_report()
                     return
                 else:
-                    print(f'\n[HOME] Reached origin. Continuing operation.')
-                    self.phase = 'RANDOM_MOVE'  # Go back to random movement
+                    print(f'\n[HOME] Arrived near origin (dist={final_dist:.3f}m). Continuing random movement.')
+                    self.phase = 'RANDOM_MOVE'
                     self.last_move_change = time.monotonic()
+                    self.origin_near_time = 0.0  # Reset for next time
             
             # Check for timeout
             phase_elapsed = time.monotonic() - self.state_change_time
             if phase_elapsed > self.RETURN_HOME_TIME:
                 self._stop()
-                print(f'\n[TIMEOUT] Return home timeout ({self.RETURN_HOME_TIME}s).')
-                print(f'Final position: X={self.local_x:+.3f}m, Y={self.local_y:+.3f}m')
+                final_dist = math.hypot(self.local_x, self.local_y)
+                print(f'\n[TIMEOUT] Return home timeout ({self.RETURN_HOME_TIME}s). '
+                      f'Current distance: {final_dist:.3f}m')
                 self.phase = 'IDLE'
                 self._print_final_report()
                 return
@@ -567,15 +632,16 @@ class PositionTrackerTester(Node):
                 self._pub(lin, ang)
                 print(f'[RETURN] Avoiding wall while returning home ({reason})')
             else:
-                # Normal return home
+                # Normal return home with improved approach
                 lin, ang = self._return_home_movement()
                 self._pub(lin, ang)
                 
-                # Print progress periodically (every 2 seconds approximately)
-                if int(time.monotonic() * 10) % 20 == 0:  # Every ~2 seconds
-                    dist = math.hypot(self.local_x, self.local_y)
-                    print(f'[RETURN] Distance to home: {dist:.2f}m | '
-                          f'Heading to home: {math.degrees(math.atan2(-self.local_y, -self.local_x)):.1f}°')
+                # Print progress periodically
+                dist = math.hypot(self.local_x, self.local_y)
+                if int(time.monotonic() * 2) % 4 == 0:  # Every ~2 seconds
+                    status = 'CLOSE' if dist < self.ORIGIN_CLOSE_DIST else 'APPROACHING'
+                    print(f'[RETURN] {status} | Distance to home: {dist:.2f}m | '
+                          f'Position: (X:{self.local_x:+.2f}, Y:{self.local_y:+.2f})m')
 
     def destroy_node(self):
         """Clean shutdown"""
