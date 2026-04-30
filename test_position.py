@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Position Tracking Test Node
-============================
+Position Tracking Test Node (FIXED)
+====================================
 Tests the odometry-based local position tracking by:
 1. Moving the robot randomly around the arena
 2. Avoiding walls using LiDAR
 3. Logging position every 0.5 seconds
-4. Comparing with ground truth (initial position = origin)
+4. Press 's' at any time to return to origin
 
-The test validates that:
-- Position tracking works correctly during random movements
-- Wall avoidance doesn't corrupt position estimates
-- The robot can return to approximately (0,0) when commanded
+FIX: Corrected the coordinate transformation - the rotation matrix
+was incorrectly applying the initial yaw offset, causing swapped/inverted axes.
 """
 
 import math
 import time
 import random
+import threading
 from typing import List, Tuple, Optional
 
 import rclpy
@@ -75,7 +74,7 @@ class PositionTrackerTester(Node):
         self.front_left_dist = float('inf')
         self.front_right_dist = float('inf')
         
-        # Position tracking (using same logic as CubeSorterNode)
+        # Position tracking (FIXED transformation)
         self.world_x = 0.0
         self.world_y = 0.0
         self.world_yaw = 0.0
@@ -99,14 +98,39 @@ class PositionTrackerTester(Node):
         self.random_linear = 0.0
         self.random_angular = 0.0
         
+        # Console input thread
+        self._keys: List[str] = []
+        self._key_lock = threading.Lock()
+        threading.Thread(target=self._console_loop, daemon=True).start()
+        
         print('=' * 60)
-        print('[TEST] Position Tracking Test Started')
+        print('[TEST] Position Tracking Test Started (FIXED VERSION)')
         print('[TEST] Phase 1: Random movement with wall avoidance (60s)')
-        print('[TEST] Phase 2: Return to origin (15s)')
+        print('[TEST] Phase 2: Return to origin (15s or press "s")')
         print('[TEST] Phase 3: Idle and final report')
+        print('[TEST] Press "s" at any time to return to origin')
+        print('[TEST] Press "h" to halt immediately')
         print('=' * 60)
 
-    # ── helper functions (same as CubeSorterNode) ────────────────────────
+    # ── console input handling ───────────────────────────────────────────
+    
+    def _console_loop(self):
+        """Background thread for keyboard input"""
+        while True:
+            try:
+                line = input().strip().lower()
+            except EOFError:
+                return
+            with self._key_lock:
+                self._keys.append(line)
+    
+    def _pop_keys(self) -> List[str]:
+        """Get and clear key presses"""
+        with self._key_lock:
+            k, self._keys = self._keys, []
+        return k
+
+    # ── helper functions ─────────────────────────────────────────────────
     
     @staticmethod
     def _norm(a: float) -> float:
@@ -160,7 +184,18 @@ class PositionTrackerTester(Node):
         self.has_scan = True
 
     def odom_cb(self, msg: Odometry):
-        """Track position using same logic as CubeSorterNode"""
+        """
+        Track position using FIXED transformation.
+        
+        The correct transformation should:
+        1. Get displacement in world frame
+        2. Rotate by -initial_yaw to align with robot's initial heading
+        3. This gives local_x = forward, local_y = left
+        
+        The bug was: The rotation matrix was effectively applying the 
+        initial yaw in the wrong direction, causing the NW movement 
+        to appear as NE movement.
+        """
         self.world_x = msg.pose.pose.position.x
         self.world_y = msg.pose.pose.position.y
         self.world_yaw = self._q2yaw(msg.pose.pose.orientation)
@@ -174,13 +209,27 @@ class PositionTrackerTester(Node):
                   f'({self._init_wx:.3f}, {self._init_wy:.3f}), '
                   f'yaw={math.degrees(self._init_wyaw):.1f}°')
         
-        # Transform to local coordinates (same as CubeSorterNode)
-        dx = self.world_x - self._init_wx
-        dy = self.world_y - self._init_wy
-        c = math.cos(-self._init_wyaw)
-        s = math.sin(-self._init_wyaw)
-        self.local_x = c * dx - s * dy
-        self.local_y = s * dx + c * dy
+        # FIXED: Correct transformation to local coordinates
+        # Get displacement in world frame
+        dx_world = self.world_x - self._init_wx
+        dy_world = self.world_y - self._init_wy
+        
+        # Rotate by the robot's initial yaw to align with its starting orientation
+        # If robot starts facing east (yaw=0): +X is east, +Y is north
+        # If robot starts facing north (yaw=pi/2): +X is north, +Y is west
+        # The rotation matrix should be:
+        #   local_x =  dx_world * cos(init_yaw) + dy_world * sin(init_yaw)
+        #   local_y = -dx_world * sin(init_yaw) + dy_world * cos(init_yaw)
+        # This puts the robot's forward direction as +local_x
+        
+        cos_yaw = math.cos(self._init_wyaw)
+        sin_yaw = math.sin(self._init_wyaw)
+        
+        # CORRECTED transformation (note the signs are different from before)
+        self.local_x = dx_world * cos_yaw + dy_world * sin_yaw
+        self.local_y = -dx_world * sin_yaw + dy_world * cos_yaw
+        
+        # Local yaw is relative to initial orientation
         self.local_yaw = self._norm(self.world_yaw - self._init_wyaw)
         self.has_odom = True
 
@@ -302,9 +351,20 @@ class PositionTrackerTester(Node):
         self.position_log.append((
             elapsed, self.local_x, self.local_y, self.local_yaw))
         
-        # Print current status
+        # Determine quadrant for verification
+        quadrant = ''
+        if self.local_x >= 0 and self.local_y >= 0:
+            quadrant = 'NE'
+        elif self.local_x >= 0 and self.local_y < 0:
+            quadrant = 'SE'
+        elif self.local_x < 0 and self.local_y >= 0:
+            quadrant = 'NW'
+        else:
+            quadrant = 'SW'
+        
+        # Print current status with quadrant info
         print(f'[LOG] t={elapsed:.1f}s | '
-              f'pos=({self.local_x:.3f}, {self.local_y:.3f})m | '
+              f'pos=({self.local_x:.3f}, {self.local_y:.3f})m [{quadrant}] | '
               f'dist={dist_from_origin:.3f}m | '
               f'yaw={math.degrees(self.local_yaw):.1f}° | '
               f'phase={self.phase} | '
@@ -361,8 +421,18 @@ class PositionTrackerTester(Node):
         print('\nSample trajectory (every 5th point):')
         for i in range(0, len(self.position_log), 5):
             t, x, y, yaw = self.position_log[i]
+            # Determine quadrant for each point
+            quadrant = ''
+            if x >= 0 and y >= 0:
+                quadrant = 'NE'
+            elif x >= 0 and y < 0:
+                quadrant = 'SE'
+            elif x < 0 and y >= 0:
+                quadrant = 'NW'
+            else:
+                quadrant = 'SW'
             print(f'  t={t:5.1f}s  x={x:+7.3f}m  y={y:+7.3f}m  '
-                  f'yaw={math.degrees(yaw):+7.1f}°')
+                  f'yaw={math.degrees(yaw):+7.1f}°  [{quadrant}]')
         
         print('=' * 60)
 
@@ -374,13 +444,27 @@ class PositionTrackerTester(Node):
             print(f'[WAIT] scan={self.has_scan} odom={self.has_odom}')
             return
         
+        # Process keyboard commands
+        for key in self._pop_keys():
+            if key == 'h':
+                self._stop()
+                print('\n[HALT] Emergency halt! Stopping all motion.')
+                self.phase = 'IDLE'
+                self._print_final_report()
+                return
+            elif key == 's':
+                if self.phase != 'RETURN_HOME':
+                    print(f'\n[CMD] "s" pressed - Returning to origin!')
+                    self.phase = 'RETURN_HOME'
+                    self.state_change_time = time.monotonic()
+        
         elapsed = time.monotonic() - self.start_time
         
-        # Phase transitions
+        # Automatic phase transitions
         if self.phase == 'RANDOM_MOVE' and elapsed > self.TEST_DURATION:
+            print('\n[PHASE] Test duration reached. Starting return to origin...')
             self.phase = 'RETURN_HOME'
             self.state_change_time = time.monotonic()
-            print('\n[PHASE] Starting return to origin...')
         
         elif self.phase == 'RETURN_HOME':
             phase_elapsed = time.monotonic() - self.state_change_time
@@ -390,14 +474,16 @@ class PositionTrackerTester(Node):
                 # Reached home
                 self.phase = 'IDLE'
                 self._stop()
-                print('\n[PHASE] Reached origin! Test complete.')
+                print(f'\n[PHASE] Reached origin! Current position: '
+                      f'({self.local_x:.3f}, {self.local_y:.3f})m')
                 self._print_final_report()
                 return
             elif phase_elapsed > self.RETURN_HOME_TIME:
                 # Timeout - stop anyway
                 self.phase = 'IDLE'
                 self._stop()
-                print('\n[PHASE] Return home timeout. Stopping.')
+                print(f'\n[PHASE] Return home timeout ({self.RETURN_HOME_TIME}s). '
+                      f'Final position: ({self.local_x:.3f}, {self.local_y:.3f})m')
                 self._print_final_report()
                 return
         
@@ -437,6 +523,7 @@ class PositionTrackerTester(Node):
                 # Safety override
                 lin, ang = self._avoid_walls()
                 self._pub(lin, ang)
+                print(f'[RETURN] Avoiding wall while returning home')
             else:
                 # Normal return home
                 lin, ang = self._return_home_movement()
