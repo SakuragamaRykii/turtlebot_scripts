@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Position Tracking Test Node (FIXED)
-====================================
-Tests the odometry-based local position tracking by:
-1. Moving the robot randomly around the arena
-2. Avoiding walls using LiDAR
-3. Logging position every 0.5 seconds
-4. Press 's' at any time to return to origin
+Position Tracking Test Node (FIXED V2 - Correct Coordinate System)
+==================================================================
+Tests the odometry-based local position tracking with:
+- Forward = +Y, Right = +X coordinate system
+- Wall avoidance using LiDAR
+- Position logging every 0.5 seconds
+- 's' key: return to origin
+- 'h' key: return to origin then halt
 
-FIX: Corrected the coordinate transformation - the rotation matrix
-was incorrectly applying the initial yaw offset, causing swapped/inverted axes.
+Coordinate system:
+  +Y (forward)
+   ^
+   |
+   +-----> +X (right)
+  Origin (0,0) at starting position
 """
 
 import math
@@ -28,12 +33,14 @@ from sensor_msgs.msg import LaserScan
 
 class PositionTrackerTester(Node):
     """
-    Test node that moves randomly while tracking position.
-    Validates the same position tracking logic used in CubeSorterNode.
+    Test node with corrected coordinate system:
+    - Forward movement increases Y
+    - Rightward movement increases X
+    - Origin at starting position
     """
     
     # ── motion parameters ─────────────────────────────────────────────────
-    LINEAR_SPEED = 0.08       # m/s forward
+    LINEAR_SPEED = 0.16       # m/s forward
     ANGULAR_SPEED = 0.25      # rad/s rotation
     
     # ── wall avoidance ────────────────────────────────────────────────────
@@ -74,12 +81,13 @@ class PositionTrackerTester(Node):
         self.front_left_dist = float('inf')
         self.front_right_dist = float('inf')
         
-        # Position tracking (FIXED transformation)
+        # Position tracking with correct coordinate system
+        # Forward = +Y, Right = +X
         self.world_x = 0.0
         self.world_y = 0.0
         self.world_yaw = 0.0
-        self.local_x = 0.0
-        self.local_y = 0.0
+        self.local_x = 0.0  # Right (+) / Left (-)
+        self.local_y = 0.0  # Forward (+) / Backward (-)
         self.local_yaw = 0.0
         self._init_wx = None
         self._init_wy = None
@@ -87,10 +95,8 @@ class PositionTrackerTester(Node):
         
         # Test state
         self.start_time = time.monotonic()
-        self.phase = 'RANDOM_MOVE'  # RANDOM_MOVE, RETURN_HOME, IDLE
+        self.phase = 'RANDOM_MOVE'  # RANDOM_MOVE, RETURN_HOME, HALT_AFTER_RETURN, IDLE
         self.position_log: List[Tuple[float, float, float, float]] = []
-        self.current_linear = 0.0
-        self.current_angular = 0.0
         self.last_move_change = time.monotonic()
         self.state_change_time = time.monotonic()
         
@@ -104,12 +110,12 @@ class PositionTrackerTester(Node):
         threading.Thread(target=self._console_loop, daemon=True).start()
         
         print('=' * 60)
-        print('[TEST] Position Tracking Test Started (FIXED VERSION)')
+        print('[TEST] Position Tracking Test Started (CORRECTED COORDS)')
+        print('[TEST] Coordinate system: Forward = +Y, Right = +X')
         print('[TEST] Phase 1: Random movement with wall avoidance (60s)')
         print('[TEST] Phase 2: Return to origin (15s or press "s")')
-        print('[TEST] Phase 3: Idle and final report')
-        print('[TEST] Press "s" at any time to return to origin')
-        print('[TEST] Press "h" to halt immediately')
+        print('[TEST] Press "s" to return to origin and continue')
+        print('[TEST] Press "h" to return to origin then halt')
         print('=' * 60)
 
     # ── console input handling ───────────────────────────────────────────
@@ -185,16 +191,13 @@ class PositionTrackerTester(Node):
 
     def odom_cb(self, msg: Odometry):
         """
-        Track position using FIXED transformation.
+        Track position with CORRECT coordinate system:
+        - Forward = +Y
+        - Right = +X
         
-        The correct transformation should:
-        1. Get displacement in world frame
-        2. Rotate by -initial_yaw to align with robot's initial heading
-        3. This gives local_x = forward, local_y = left
-        
-        The bug was: The rotation matrix was effectively applying the 
-        initial yaw in the wrong direction, causing the NW movement 
-        to appear as NE movement.
+        The robot's initial heading defines the +Y direction.
+        When the robot moves forward from its starting position, Y increases.
+        When the robot moves to its right from the start, X increases.
         """
         self.world_x = msg.pose.pose.position.x
         self.world_y = msg.pose.pose.position.y
@@ -209,24 +212,26 @@ class PositionTrackerTester(Node):
                   f'({self._init_wx:.3f}, {self._init_wy:.3f}), '
                   f'yaw={math.degrees(self._init_wyaw):.1f}°')
         
-        # FIXED: Correct transformation to local coordinates
         # Get displacement in world frame
         dx_world = self.world_x - self._init_wx
         dy_world = self.world_y - self._init_wy
         
-        # Rotate by the robot's initial yaw to align with its starting orientation
-        # If robot starts facing east (yaw=0): +X is east, +Y is north
-        # If robot starts facing north (yaw=pi/2): +X is north, +Y is west
-        # The rotation matrix should be:
-        #   local_x =  dx_world * cos(init_yaw) + dy_world * sin(init_yaw)
-        #   local_y = -dx_world * sin(init_yaw) + dy_world * cos(init_yaw)
-        # This puts the robot's forward direction as +local_x
+        # Rotate to align with robot's initial heading
+        # Forward direction (robot's initial +X in world) becomes +Y in local
+        # Right direction becomes +X in local
+        # 
+        # Standard rotation: if robot starts facing world_yaw angle,
+        # the local frame is rotated by init_yaw relative to world frame
+        # 
+        # Local X (right) =  world_dx * cos(yaw) + world_dy * sin(yaw)
+        # Local Y (forward) = -world_dx * sin(yaw) + world_dy * cos(yaw)
         
         cos_yaw = math.cos(self._init_wyaw)
         sin_yaw = math.sin(self._init_wyaw)
         
-        # CORRECTED transformation (note the signs are different from before)
+        # X = rightward displacement from origin
         self.local_x = dx_world * cos_yaw + dy_world * sin_yaw
+        # Y = forward displacement from origin  
         self.local_y = -dx_world * sin_yaw + dy_world * cos_yaw
         
         # Local yaw is relative to initial orientation
@@ -305,19 +310,39 @@ class PositionTrackerTester(Node):
         self.random_angular = max(-self.ANGULAR_SPEED, 
                                   min(self.ANGULAR_SPEED, self.random_angular))
         
-        print(f'[MOVE] New random movement: '
-              f'linear={self.random_linear:.3f} m/s, '
-              f'angular={math.degrees(self.random_angular):.1f} °/s')
+        # Determine movement description based on velocities
+        move_desc = ''
+        if self.random_linear > 0.03:
+            move_desc = 'forward'
+        elif self.random_linear < -0.03:
+            move_desc = 'backward'
+        else:
+            move_desc = 'stopped'
+            
+        if abs(self.random_angular) > 0.05:
+            turn_desc = 'turning right' if self.random_angular < 0 else 'turning left'
+            move_desc += f' & {turn_desc}'
+        
+        print(f'[MOVE] New random movement: {move_desc} '
+              f'(linear={self.random_linear:.3f} m/s, '
+              f'angular={math.degrees(self.random_angular):.1f} °/s)')
 
     # ── return home logic ───────────────────────────────────────────────
     
     def _return_home_movement(self) -> Tuple[float, float]:
-        """Calculate velocities to return to origin"""
-        dx = -self.local_x
-        dy = -self.local_y
-        dist = math.hypot(dx, dy)
-        target_yaw = math.atan2(dy, dx)
-        yaw_error = self._norm(target_yaw - self.local_yaw)
+        """Calculate velocities to return to origin (0,0)"""
+        # Vector from current position to origin
+        dx_to_home = -self.local_x  # Negative because we want to go to 0
+        dy_to_home = -self.local_y
+        
+        dist = math.hypot(dx_to_home, dy_to_home)
+        target_yaw = math.atan2(dy_to_home, dx_to_home)  # atan2(y, x) for direction to home
+        
+        # Current heading in local frame
+        current_heading = self.local_yaw
+        
+        # Calculate heading error: how much we need to turn to face home
+        yaw_error = self._norm(target_yaw - current_heading)
         
         if dist < 0.05:  # Within 5cm of origin
             return 0.0, 0.0
@@ -330,7 +355,7 @@ class PositionTrackerTester(Node):
         if abs(yaw_error) < math.radians(20):
             linear = min(self.LINEAR_SPEED * 0.5, dist * 0.5)
         else:
-            linear = 0.0
+            linear = 0.0  # Turn in place if not facing home
         
         return linear, angular
 
@@ -351,22 +376,25 @@ class PositionTrackerTester(Node):
         self.position_log.append((
             elapsed, self.local_x, self.local_y, self.local_yaw))
         
-        # Determine quadrant for verification
-        quadrant = ''
-        if self.local_x >= 0 and self.local_y >= 0:
-            quadrant = 'NE'
-        elif self.local_x >= 0 and self.local_y < 0:
-            quadrant = 'SE'
-        elif self.local_x < 0 and self.local_y >= 0:
-            quadrant = 'NW'
+        # Determine cardinal direction for verification
+        direction = ''
+        if abs(self.local_x) < 0.05 and abs(self.local_y) < 0.05:
+            direction = 'AT ORIGIN'
         else:
-            quadrant = 'SW'
+            if self.local_y > 0.05:
+                direction += 'N'
+            elif self.local_y < -0.05:
+                direction += 'S'
+            if self.local_x > 0.05:
+                direction += 'E'
+            elif self.local_x < -0.05:
+                direction += 'W'
         
-        # Print current status with quadrant info
+        # Print current status with direction
         print(f'[LOG] t={elapsed:.1f}s | '
-              f'pos=({self.local_x:.3f}, {self.local_y:.3f})m [{quadrant}] | '
+              f'pos=(X:{self.local_x:+.3f}, Y:{self.local_y:+.3f})m [{direction}] | '
               f'dist={dist_from_origin:.3f}m | '
-              f'yaw={math.degrees(self.local_yaw):.1f}° | '
+              f'heading={math.degrees(self.local_yaw):.1f}° | '
               f'phase={self.phase} | '
               f'walls: F={self.front_dist:.2f}m L={self.left_dist:.2f}m R={self.right_dist:.2f}m')
 
@@ -404,6 +432,9 @@ class PositionTrackerTester(Node):
         print(f'Total path length (approximate): {total_path:.3f}m')
         
         # Final position check
+        final_x, final_y = self.local_x, self.local_y
+        print(f'Final position: X={final_x:+.3f}m, Y={final_y:+.3f}m')
+        
         if final_dist < 0.10:
             print(f'\n✅ SUCCESS: Robot returned to within 10cm of origin')
         elif final_dist < 0.25:
@@ -419,20 +450,24 @@ class PositionTrackerTester(Node):
                   f'(max distance {max_dist:.2f}m)')
         
         print('\nSample trajectory (every 5th point):')
+        print('  Time    X(m)     Y(m)     Heading(°)  Direction')
+        print('  ------  -------  -------  ----------  ---------')
         for i in range(0, len(self.position_log), 5):
             t, x, y, yaw = self.position_log[i]
-            # Determine quadrant for each point
-            quadrant = ''
-            if x >= 0 and y >= 0:
-                quadrant = 'NE'
-            elif x >= 0 and y < 0:
-                quadrant = 'SE'
-            elif x < 0 and y >= 0:
-                quadrant = 'NW'
+            # Determine direction
+            direction = ''
+            if abs(x) < 0.05 and abs(y) < 0.05:
+                direction = 'ORIGIN'
             else:
-                quadrant = 'SW'
-            print(f'  t={t:5.1f}s  x={x:+7.3f}m  y={y:+7.3f}m  '
-                  f'yaw={math.degrees(yaw):+7.1f}°  [{quadrant}]')
+                if y > 0.05:
+                    direction += 'N'
+                elif y < -0.05:
+                    direction += 'S'
+                if x > 0.05:
+                    direction += 'E'
+                elif x < -0.05:
+                    direction += 'W'
+            print(f'  {t:5.1f}s  {x:+7.3f}  {y:+7.3f}  {math.degrees(yaw):+10.1f}  {direction:>9}')
         
         print('=' * 60)
 
@@ -447,14 +482,15 @@ class PositionTrackerTester(Node):
         # Process keyboard commands
         for key in self._pop_keys():
             if key == 'h':
-                self._stop()
-                print('\n[HALT] Emergency halt! Stopping all motion.')
-                self.phase = 'IDLE'
-                self._print_final_report()
-                return
+                # Return to origin then halt
+                if self.phase not in ['RETURN_HOME', 'HALT_AFTER_RETURN']:
+                    print(f'\n[CMD] "h" pressed - Returning to origin before halting...')
+                    self.phase = 'HALT_AFTER_RETURN'
+                    self.state_change_time = time.monotonic()
             elif key == 's':
-                if self.phase != 'RETURN_HOME':
-                    print(f'\n[CMD] "s" pressed - Returning to origin!')
+                # Return to origin and continue (go to IDLE or resume)
+                if self.phase not in ['RETURN_HOME', 'HALT_AFTER_RETURN']:
+                    print(f'\n[CMD] "s" pressed - Returning to origin...')
                     self.phase = 'RETURN_HOME'
                     self.state_change_time = time.monotonic()
         
@@ -466,24 +502,30 @@ class PositionTrackerTester(Node):
             self.phase = 'RETURN_HOME'
             self.state_change_time = time.monotonic()
         
-        elif self.phase == 'RETURN_HOME':
-            phase_elapsed = time.monotonic() - self.state_change_time
+        elif self.phase in ['RETURN_HOME', 'HALT_AFTER_RETURN']:
             dist = math.hypot(self.local_x, self.local_y)
             
-            if dist < 0.05 and phase_elapsed > 2.0:
-                # Reached home
-                self.phase = 'IDLE'
+            # Check if we've reached home
+            if dist < 0.05:
                 self._stop()
-                print(f'\n[PHASE] Reached origin! Current position: '
-                      f'({self.local_x:.3f}, {self.local_y:.3f})m')
-                self._print_final_report()
-                return
-            elif phase_elapsed > self.RETURN_HOME_TIME:
-                # Timeout - stop anyway
-                self.phase = 'IDLE'
+                if self.phase == 'HALT_AFTER_RETURN':
+                    print(f'\n[HALT] Reached origin. Halting as requested.')
+                    print(f'Final position: X={self.local_x:+.3f}m, Y={self.local_y:+.3f}m')
+                    self.phase = 'IDLE'
+                    self._print_final_report()
+                    return
+                else:
+                    print(f'\n[HOME] Reached origin. Continuing operation.')
+                    self.phase = 'RANDOM_MOVE'  # Go back to random movement
+                    self.last_move_change = time.monotonic()
+            
+            # Check for timeout
+            phase_elapsed = time.monotonic() - self.state_change_time
+            if phase_elapsed > self.RETURN_HOME_TIME:
                 self._stop()
-                print(f'\n[PHASE] Return home timeout ({self.RETURN_HOME_TIME}s). '
-                      f'Final position: ({self.local_x:.3f}, {self.local_y:.3f})m')
+                print(f'\n[TIMEOUT] Return home timeout ({self.RETURN_HOME_TIME}s).')
+                print(f'Final position: X={self.local_x:+.3f}m, Y={self.local_y:+.3f}m')
+                self.phase = 'IDLE'
                 self._print_final_report()
                 return
         
@@ -515,19 +557,25 @@ class PositionTrackerTester(Node):
                 # Normal random movement
                 self._pub(self.random_linear, self.random_angular)
         
-        elif self.phase == 'RETURN_HOME':
+        elif self.phase in ['RETURN_HOME', 'HALT_AFTER_RETURN']:
             # Check walls even when returning home
             should_avoid, reason = self._check_walls()
             
             if should_avoid and 'CRITICAL' in reason:
-                # Safety override
+                # Safety override for critical wall proximity
                 lin, ang = self._avoid_walls()
                 self._pub(lin, ang)
-                print(f'[RETURN] Avoiding wall while returning home')
+                print(f'[RETURN] Avoiding wall while returning home ({reason})')
             else:
                 # Normal return home
                 lin, ang = self._return_home_movement()
                 self._pub(lin, ang)
+                
+                # Print progress periodically (every 2 seconds approximately)
+                if int(time.monotonic() * 10) % 20 == 0:  # Every ~2 seconds
+                    dist = math.hypot(self.local_x, self.local_y)
+                    print(f'[RETURN] Distance to home: {dist:.2f}m | '
+                          f'Heading to home: {math.degrees(math.atan2(-self.local_y, -self.local_x)):.1f}°')
 
     def destroy_node(self):
         """Clean shutdown"""
