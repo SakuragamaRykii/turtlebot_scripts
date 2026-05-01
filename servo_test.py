@@ -1,21 +1,38 @@
-import RPi.GPIO as GPIO # GPIO Library
-# sudo apt-get update && sudo apt-get install python3-rpi.gpi
-from time import sleep
+import time
+import pigpio
 
-GPIO.setmode(GPIO.BOARD) # access pins
-GPIO.setup(18, GPIO.OUT) # connect to pin 18
+SERVO_GPIO = 18
 
-pwm = GPIO.PWM(18, 50) # set up 50Hz PWM on pin 18
-pwm.start(0)
+SAFE_MIN = 1000
+SAFE_MID = 1500
+SAFE_MAX = 2000
 
-# Test motor (duty cycle / period)
-pwm.ChangeDutyCycle(5) # left
-sleep(1)
-pwm.ChangeDutyCycle(7.5) # neutral
-sleep(1)
-pwm.ChangeDutyCycle(10) # right
-sleep(1)
+pi = pigpio.pi()
+if not pi.connected:
+    raise RuntimeError("pigpio daemon not connected")
 
-# exit
-pwm.stop()
-GPIO.cleanup()
+def set_pulse(us):
+    us = max(SAFE_MIN, min(SAFE_MAX, us))
+    pi.set_servo_pulsewidth(SERVO_GPIO, us)
+    print(f"pulse = {us}")
+
+try:
+    print("Move to middle")
+    set_pulse(SAFE_MID)
+    time.sleep(1.5)
+
+    print("Move to one side")
+    set_pulse(SAFE_MIN)
+    time.sleep(1.5)
+
+    print("Move to other side")
+    set_pulse(SAFE_MAX)
+    time.sleep(1.5)
+
+    print("Back to middle")
+    set_pulse(SAFE_MID)
+    time.sleep(1.5)
+
+finally:
+    pi.set_servo_pulsewidth(SERVO_GPIO, 0)
+    pi.stop()
