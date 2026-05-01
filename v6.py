@@ -12,7 +12,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import CompressedImage, LaserScan
+from sensor_msgs.msg import CompressedImage, Image, LaserScan
 
 try:
     import RPi.GPIO as GPIO
@@ -22,6 +22,7 @@ except Exception:
 
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
+DETECT_AT_REFERENCE_SIZE = True
 
 MIN_RED_AREA = 2200
 MIN_BLUE_AREA = 1800
@@ -303,35 +304,49 @@ class CubeDetector:
         self.blue_tracker = StableTracker(alpha=0.16, max_missing=10, max_jump=80)
 
     def detect(self, frame):
-        frame = cv2.GaussianBlur(frame, (5, 5), 0)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        original_h, original_w = frame.shape[:2]
+        work = frame
+        scale_x = 1.0
+        scale_y = 1.0
 
-        red_mask = build_red_mask(hsv, frame)
-        blue_mask = build_blue_mask(hsv, frame)
+        if DETECT_AT_REFERENCE_SIZE and (original_w != FRAME_WIDTH or original_h != FRAME_HEIGHT):
+            work = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
+            scale_x = original_w / float(FRAME_WIDTH)
+            scale_y = original_h / float(FRAME_HEIGHT)
+
+        work = cv2.GaussianBlur(work, (5, 5), 0)
+        hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+
+        red_mask = build_red_mask(hsv, work)
+        blue_mask = build_blue_mask(hsv, work)
 
         red_box = self.red_tracker.update(find_square(red_mask, MIN_RED_AREA))
         blue_box = self.blue_tracker.update(find_square(blue_mask, MIN_BLUE_AREA))
 
-        blue_obs = self.box_to_obs('blue', blue_box, self.blue_tracker.missing)
-        red_obs = self.box_to_obs('red', red_box, self.red_tracker.missing)
+        blue_obs = self.box_to_obs('blue', blue_box, self.blue_tracker.missing, scale_x, scale_y)
+        red_obs = self.box_to_obs('red', red_box, self.red_tracker.missing, scale_x, scale_y)
 
         if blue_obs is not None:
             return blue_obs
         return red_obs
 
-    def box_to_obs(self, color, box, missing):
+    def box_to_obs(self, color, box, missing, scale_x, scale_y):
         if box is None:
             return None
         x, y, w, h, score = box
+        mapped_x = int(round(x * scale_x))
+        mapped_y = int(round(y * scale_y))
+        mapped_w = int(round(w * scale_x))
+        mapped_h = int(round(h * scale_y))
         return CubeObservation(
             color=color,
-            cx=float(x + w / 2.0),
-            cy=float(y + h / 2.0),
-            area=float(w * h),
-            bbox_x=int(x),
-            bbox_y=int(y),
-            bbox_w=int(w),
-            bbox_h=int(h),
+            cx=float(mapped_x + mapped_w / 2.0),
+            cy=float(mapped_y + mapped_h / 2.0),
+            area=float(mapped_w * mapped_h),
+            bbox_x=mapped_x,
+            bbox_y=mapped_y,
+            bbox_w=mapped_w,
+            bbox_h=mapped_h,
             score=float(score),
             missing=int(missing),
         )
@@ -421,7 +436,13 @@ class TrackingCubeV6(Node):
         self.image_sub = self.create_subscription(
             CompressedImage,
             '/camera/image_raw/compressed',
-            self.image_callback,
+            self.compressed_image_callback,
+            qos_profile_sensor_data,
+        )
+        self.raw_image_sub = self.create_subscription(
+            Image,
+            '/camera/image_raw',
+            self.raw_image_callback,
             qos_profile_sensor_data,
         )
 
@@ -438,6 +459,8 @@ class TrackingCubeV6(Node):
         self.front_dist = float('inf')
         self.image_width = None
         self.image_height = None
+        self.image_encoding = 'none'
+        self.image_logged = False
 
         self.world_yaw = 0.0
         self.init_yaw = None
@@ -565,7 +588,7 @@ class TrackingCubeV6(Node):
         self.local_yaw = self.normalize_angle(self.world_yaw - self.init_yaw)
         self.has_odom = True
 
-    def image_callback(self, msg):
+    def compressed_image_callback(self, msg):
         self.has_image = True
         try:
             np_arr = np.frombuffer(msg.data, np.uint8)
@@ -577,7 +600,52 @@ class TrackingCubeV6(Node):
             self.clear_zone_marker()
             return
 
+        self.process_frame(frame, 'compressed')
+
+    def raw_image_callback(self, msg):
+        self.has_image = True
+        try:
+            frame = self.ros_image_to_bgr(msg)
+        except Exception as exc:
+            print(f'[IMAGE] raw decode failed: {exc}')
+            self.clear_cube()
+            self.clear_zone_marker()
+            return
+
+        self.process_frame(frame, msg.encoding)
+
+    def ros_image_to_bgr(self, msg):
+        height = int(msg.height)
+        width = int(msg.width)
+        encoding = msg.encoding.lower()
+
+        if encoding in ('rgb8', 'rgb888'):
+            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width, 3))
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+        if encoding in ('bgr8', 'bgr888'):
+            return np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width, 3)).copy()
+
+        if encoding in ('mono8', '8uc1'):
+            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width))
+            return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+
+        if encoding in ('rgba8', 'rgba8888'):
+            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width, 4))
+            return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+
+        if encoding in ('bgra8', 'bgra8888'):
+            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width, 4))
+            return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+
+        raise ValueError(f'unsupported encoding {msg.encoding}')
+
+    def process_frame(self, frame, encoding):
         self.image_height, self.image_width = frame.shape[:2]
+        self.image_encoding = encoding
+        if not self.image_logged:
+            print(f'[IMAGE] source={encoding} size={self.image_width}x{self.image_height}')
+            self.image_logged = True
 
         if self.state in ('SEARCH_CUBE', 'ALIGN_CUBE', 'APPROACH_CUBE', 'WAIT_FOR_DATA'):
             cube = self.cube_detector.detect(frame)
@@ -910,7 +978,7 @@ class TrackingCubeV6(Node):
         print(
             f'[STATUS] {self.state} {cube_text} {marker_text} '
             f'carry={self.carried_color} dest={self.destination_marker_id} '
-            f'front={self.front_dist:.3f}m'
+            f'front={self.front_dist:.3f}m image={self.image_encoding} {self.image_width}x{self.image_height}'
         )
 
     def destroy_node(self):
