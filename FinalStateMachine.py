@@ -1130,9 +1130,24 @@ class CubeSorterNode(Node):
             self._stop()
             return
 
+        # if self.state == 'WAIT_FOR_DATA':
+        #     self._stop()
+        #     self._set_state('INIT_SWEEP', 'Sensors ready')
+        #     return
         if self.state == 'WAIT_FOR_DATA':
             self._stop()
-            self._set_state('INIT_SWEEP', 'Sensors ready')
+            # Hard-code arena dimensions for testing (in meters)
+            self.arena = ArenaMap(
+                front=1.0,   # Distance to front wall
+                back=1.0,    # Distance to back wall
+                left=1.0,    # Distance to left wall
+                right=1.0    # Distance to right wall
+            )
+            print(f'[INIT] Arena dimensions HARD-CODED for testing:')
+            print(f'      front={self.arena.front:.2f}m back={self.arena.back:.2f}m')
+            print(f'      left={self.arena.left:.2f}m right={self.arena.right:.2f}m')
+            print(f'      width={self.arena.width:.2f}m depth={self.arena.depth:.2f}m')
+            self._set_state('IDLE', 'Arena hard-coded. Press s to start search.')
             return
 
         handlers = {
