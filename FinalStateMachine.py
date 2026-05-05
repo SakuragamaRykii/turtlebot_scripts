@@ -1,35 +1,9 @@
 #!/usr/bin/env python3
 """
-TurtleBot3 WafflePi – Cube Zone Sorter (GRABBER + SMART DELIVERY)
+TurtleBot3 WafflePi – Cube Zone Sorter (GRABBER + SMART DELIVERY) - FIXED
 ==================================================================
-States
-------
-WAIT_FOR_DATA  : Spin until LiDAR + odometry + camera are all live.
-INIT_SWEEP     : Rotate 360° with LiDAR to measure arena wall distances.
-IDLE           : Stationary. Waits for 's' key to begin search.
-SEARCH         : Rotate 360°, log cube colours, positions, and zone correctness.
-TURN_TO_APPROACH : Rotate to face the misplaced cube.
-APPROACH       : Drive straight toward the cube; stop when close.
-GRAB_CUBE      : Activate servo to clamp cube.
-PLAN_DELIVERY  : Check center line for obstacles and plan delivery path.
-TURN_TO_DELIVER : Rotate to face delivery position.
-DELIVER        : Drive to y=0 delivery point.
-RELEASE_CUBE   : Open grabber to release cube.
-TURN_HOME      : Rotate to face the origin (0, 0).
-RETURN_HOME    : Drive back to the origin.
-
-Key bindings (console, any time)
----------------------------------
-s  – (from IDLE) start search sweep
-h  – halt immediately and return to IDLE
-
-New Features
--------------
-- PiCamera distance estimation using known cube size (5.8cm)
-- Arena boundary filtering for cube detection
-- Center line obstacle detection and avoidance
-- Servo grabber control (GPIO)
-- Adaptive delivery path planning
+FIXED: Records cube angles during search and uses them for approach
+       without requiring continuous visual contact during turns.
 """
 
 import math
@@ -63,7 +37,7 @@ except ImportError:
 @dataclass
 class CubeEntry:
     color: str        # 'red' | 'blue'
-    angle_rad: float  # local yaw when cube was spotted
+    angle_rad: float  # local yaw when cube was spotted (ROBOT'S HEADING)
     zone: str         # 'red_zone' | 'blue_zone'
     correct: bool     # True if cube is already in its matching zone
     x_pos: float = 0.0  # X position in arena
@@ -115,7 +89,7 @@ class CubeSorterNode(Node):
     EMERGENCY_DIST    = 0.15    # m  hard stop any motion
 
     # ── angle tolerances ─────────────────────────────────────────────────────
-    YAW_TOL           = math.radians(3.0)
+    YAW_TOL           = math.radians(5.0)  # Increased from 3° for more reliable turning
     SWEEP_DONE_TOL    = math.radians(5.0)
 
     # ── timing ───────────────────────────────────────────────────────────────
@@ -131,13 +105,12 @@ class CubeSorterNode(Node):
     MIN_SOLIDITY      = 0.70
     MIN_CENTER_Y      = 0.18    # fraction of image height (ignore sky)
     CONFIRM_FRAMES    = 3       # stable frames before logging a cube
-    LOST_TIMEOUT      = 0.80    # s before giving up on a lost cube
+    LOST_TIMEOUT      = 2.0     # s before giving up on a lost cube (INCREASED)
+    APPROACH_LOST_TIMEOUT = 3.0 # s - extra time during approach before giving up
 
     # ── PiCamera parameters for distance estimation ──────────────────────────
     CUBE_REAL_WIDTH = 0.058     # m - actual cube width (5.8cm)
     CUBE_REAL_HEIGHT = 0.058    # m - actual cube height (5.8cm)
-    # Focal length in pixels (calibrate this for your camera)
-    # For typical PiCamera v2: ~500-600 pixels at 640x480
     FOCAL_LENGTH_PX = 550.0     # pixels - NEEDS CALIBRATION
     
     # Distance filtering
@@ -167,17 +140,21 @@ class CubeSorterNode(Node):
     MAX_DELIVERY_ATTEMPTS = 3  # Maximum attempts to find clear path
 
     # ── servo control ────────────────────────────────────────────────────────
-    SERVO_PIN = 18          # GPIO pin for servo
+    SERVO_PIN = 12          # GPIO pin for servo (UPDATED to your pin)
     SERVO_CLAMPED = 1800    # PWM value for clamped position
     SERVO_OPEN = 1100       # PWM value for open position
     SERVO_FREQ = 50         # Hz
 
     # ── search logging window ─────────────────────────────────────────────────
-    SEARCH_LOG_WINDOW = math.radians(15.0)  # don't re-log within this arc
-    SEARCH_POSITION_WINDOW = 0.15  # m - don't re-log cubes within this distance
+    SEARCH_LOG_WINDOW = math.radians(20.0)  # INCREASED - don't re-log within this arc
+    SEARCH_POSITION_WINDOW = 0.20  # m - INCREASED don't re-log cubes within this distance
 
     # ── return-home arrival threshold ────────────────────────────────────────
-    HOME_ARRIVE_DIST  = 0.10    # m - tolerance for reaching origin
+    HOME_ARRIVE_DIST  = 0.15    # m - INCREASED tolerance for reaching origin
+
+    # ── blind approach parameters ────────────────────────────────────────────
+    BLIND_APPROACH_SPEED = 0.05  # m/s - slower speed when approaching blind
+    BLIND_APPROACH_MAX_DIST = 1.5  # m - max distance to drive blind
 
     # ────────────────────────────────────────────────────────────────────────
     def __init__(self):
@@ -202,7 +179,7 @@ class CubeSorterNode(Node):
                 GPIO.setmode(GPIO.BCM)
                 GPIO.setup(self.SERVO_PIN, GPIO.OUT)
                 self.servo = GPIO.PWM(self.SERVO_PIN, self.SERVO_FREQ)
-                self.servo.start(self.SERVO_OPEN)
+                self.servo.start(self.SERVO_OPEN / 20000.0 * 100)  # Convert to duty cycle
                 print(f'[SERVO] Initialized on GPIO {self.SERVO_PIN}')
             except Exception as e:
                 print(f'[SERVO] Failed to initialize: {e}')
@@ -250,7 +227,7 @@ class CubeSorterNode(Node):
         self._fbbox_w: float = 0.0
         self._prev_obs: Optional[dict] = None
 
-        # Arena map (set during INIT_SWEEP)
+        # Arena map (set during INIT_SWEEP or hard-coded)
         self.arena: Optional[ArenaMap] = None
         self._init_front: List[float] = []
         self._init_back:  List[float] = []
@@ -268,10 +245,14 @@ class CubeSorterNode(Node):
         self._sweep_accum = 0.0
         self._sweep_prev  = 0.0
         self._sweep_logged: List[Tuple[float, float]] = []  # (yaw, distance)
+        self._search_start_yaw = 0.0  # Yaw when search started
 
         # Approach / delivery state
         self.approach_target: Optional[CubeEntry] = None
         self._turn_target_yaw = 0.0
+        self._turn_start_time = 0.0  # When we started turning
+        self._blind_approach_start_pos = (0.0, 0.0)  # Position when blind approach started
+        self._blind_approach_dist_traveled = 0.0  # Distance traveled in blind approach
         self.delivery_x = 0.0  # Target X for delivery
         self.delivery_y = 0.0  # Target Y for delivery (always near 0)
         self.delivery_attempts = 0  # Counter for path planning attempts
@@ -288,9 +269,9 @@ class CubeSorterNode(Node):
         self._key_lock = threading.Lock()
         threading.Thread(target=self._console_loop, daemon=True).start()
 
-        print('[BOOT] CubeSorter started (GRABBER + SMART DELIVERY)')
+        print('[BOOT] CubeSorter started (GRABBER + SMART DELIVERY - FIXED)')
         print('[BOOT] Coordinate system: Forward = +Y, Right = +X')
-        print('[BOOT] Features: Distance estimation, obstacle avoidance, servo grabber')
+        print('[BOOT] FIX: Records cube angles for blind approach')
         print('[CMD]  s = start search | h = halt to IDLE')
 
     # ── servo control ─────────────────────────────────────────────────────────
@@ -316,11 +297,7 @@ class CubeSorterNode(Node):
     # ── distance estimation ──────────────────────────────────────────────────
     
     def _estimate_distance(self, bbox_w: float, bbox_h: float) -> float:
-        """
-        Estimate distance to cube using known real-world dimensions.
-        Uses the larger of width/height for better accuracy.
-        """
-        # Use the larger dimension for estimation
+        """Estimate distance to cube using known real-world dimensions."""
         if bbox_w > bbox_h:
             pixel_size = bbox_w
             real_size = self.CUBE_REAL_WIDTH
@@ -331,29 +308,21 @@ class CubeSorterNode(Node):
         if pixel_size < 1:
             return float('inf')
         
-        # Distance = (focal_length * real_size) / pixel_size
         distance = (self.FOCAL_LENGTH_PX * real_size) / pixel_size
         return distance
     
     def _cube_position_from_camera(self, bbox_cx: float, bbox_cy: float, 
                                    distance: float) -> Tuple[float, float]:
-        """
-        Calculate the cube's position in local coordinates based on camera detection.
-        This is approximate and assumes the cube is on the ground plane.
-        """
+        """Calculate the cube's position in arena coordinates."""
         if not self.img_w or not self.img_h:
             return 0.0, 0.0
         
-        # Calculate angle from camera center
         cx_offset = bbox_cx - self.img_w / 2.0
-        # Convert pixel offset to angle (approximate)
         angle_offset = math.atan2(cx_offset, self.FOCAL_LENGTH_PX)
         
-        # The cube is at distance 'd' from robot, at angle 'angle_offset' from forward
         cube_x = distance * math.sin(angle_offset)
         cube_y = distance * math.cos(angle_offset)
         
-        # Transform to arena coordinates
         cube_arena_x = self.local_x + cube_x * math.cos(self.local_yaw) - cube_y * math.sin(self.local_yaw)
         cube_arena_y = self.local_y + cube_x * math.sin(self.local_yaw) + cube_y * math.cos(self.local_yaw)
         
@@ -408,13 +377,21 @@ class CubeSorterNode(Node):
             self._init_left.clear();  self._init_right.clear()
         elif new == 'SEARCH':
             self._sweep_prev  = self.local_yaw
+            self._search_start_yaw = self.local_yaw
             self._sweep_accum = 0.0
             self._sweep_logged.clear()
             self.correct_cubes.clear()
             self.wrong_cubes.clear()
             self.all_cubes.clear()
+            print(f'[SEARCH] Starting search sweep at yaw={math.degrees(self.local_yaw):.1f}°')
         elif new == 'TURN_TO_APPROACH':
-            self._turn_target_yaw = self.approach_target.angle_rad
+            if self.approach_target:
+                self._turn_target_yaw = self.approach_target.angle_rad
+                self._turn_start_time = time.monotonic()
+                print(f'[TURN] Target cube was at yaw={math.degrees(self._turn_target_yaw):.1f}°')
+                print(f'[TURN] Current yaw={math.degrees(self.local_yaw):.1f}°')
+            else:
+                print('[TURN] ERROR: No approach target set!')
         elif new == 'GRAB_CUBE':
             self._grab_cube()
         elif new == 'PLAN_DELIVERY':
@@ -425,96 +402,69 @@ class CubeSorterNode(Node):
             dx = -self.local_x
             dy = -self.local_y
             self._turn_target_yaw = math.atan2(dx, dy)
+            self._turn_start_time = time.monotonic()
+        elif new == 'APPROACH':
+            # Record start position for blind approach tracking
+            self._blind_approach_start_pos = (self.local_x, self.local_y)
+            self._blind_approach_dist_traveled = 0.0
+            print(f'[APPROACH] Starting approach from ({self.local_x:.2f}, {self.local_y:.2f})')
 
     # ── delivery path planning ───────────────────────────────────────────────
     
     def _check_center_line_obstacles(self) -> List[dict]:
-        """
-        Check if there are any cubes on or near the center line (y=0)
-        that would obstruct the delivery path.
-        """
         obstacles = []
-        
-        # Check all known cubes
         for cube in self.all_cubes:
             if cube.on_center_line:
                 obstacles.append({
-                    'x': cube.x_pos,
-                    'y': cube.y_pos,
+                    'x': cube.x_pos, 'y': cube.y_pos,
                     'color': cube.color,
                     'distance': abs(cube.y_pos - self.CENTER_LINE_Y)
                 })
-        
-        # Also check currently visible cubes
         for obs in self.all_visible_cubes:
             if obs.get('world_y', 0) is not None:
                 if abs(obs.get('world_y', 0) - self.CENTER_LINE_Y) < self.CENTER_LINE_DETECT_DIST:
                     obstacles.append({
-                        'x': obs.get('world_x', 0),
-                        'y': obs.get('world_y', 0),
+                        'x': obs.get('world_x', 0), 'y': obs.get('world_y', 0),
                         'color': obs['color'],
                         'distance': abs(obs.get('world_y', 0) - self.CENTER_LINE_Y)
                     })
-        
         return obstacles
     
     def _plan_delivery_path(self):
-        """
-        Plan the delivery path to y=0 center line.
-        Checks for obstacles and adjusts delivery X position if needed.
-        """
         if not self.cube_held:
             self._set_state('TURN_HOME', 'No cube held')
             return
         
-        # Initial target: closest y=0 point at current X
         target_x = self.local_x
         target_y = self.CENTER_LINE_Y
         
-        # Apply zone bias
         if self.cube_held.color == 'red':
             target_x = max(self.ZONE_BOUNDARY_X + 0.05, target_x)
         else:
             target_x = min(self.ZONE_BOUNDARY_X - 0.05, target_x)
         
-        # Clamp to arena boundaries
         if self.arena:
             target_x = self._clamp(target_x, -self.arena.left + 0.15, self.arena.right - 0.15)
         
-        # Check for obstacles on center line
         obstacles = self._check_center_line_obstacles()
         
         if obstacles:
             print(f'[PLAN] Found {len(obstacles)} obstacle(s) on center line')
-            
-            # Try to find a clear path
             for attempt in range(self.MAX_DELIVERY_ATTEMPTS):
-                # Check if current target collides with any obstacle
                 collision = False
                 for obs in obstacles:
                     if abs(target_x - obs['x']) < self.CENTER_LINE_DETECT_DIST:
                         collision = True
-                        print(f'[PLAN] Collision detected with {obs["color"]} cube at x={obs["x"]:.2f}')
+                        print(f'[PLAN] Collision with {obs["color"]} cube at x={obs["x"]:.2f}')
                         break
-                
                 if not collision:
                     break
-                
-                # Adjust target X
                 if attempt == 0:
-                    # First try: move forward on X axis (positive direction)
                     target_x += self.DELIVERY_X_OFFSET
-                    print(f'[PLAN] Attempt {attempt+1}: Shifting forward to x={target_x:.2f}')
                 elif attempt == 1:
-                    # Second try: move backward on X axis
-                    target_x -= 2 * self.DELIVERY_X_OFFSET  # Go opposite direction
-                    print(f'[PLAN] Attempt {attempt+1}: Shifting backward to x={target_x:.2f}')
+                    target_x -= 2 * self.DELIVERY_X_OFFSET
                 else:
-                    # Last resort: try a random offset
                     target_x += self.DELIVERY_X_OFFSET * (attempt - 1)
-                    print(f'[PLAN] Attempt {attempt+1}: Trying offset to x={target_x:.2f}')
-                
-                # Re-clamp to arena boundaries
                 if self.arena:
                     target_x = self._clamp(target_x, -self.arena.left + 0.15, self.arena.right - 0.15)
         
@@ -615,6 +565,12 @@ class CubeSorterNode(Node):
         self.local_y = -dx_world * sin_yaw + dy_world * cos_yaw
         self.local_yaw = self._norm(self.world_yaw - self._init_wyaw)
         self.has_odom  = True
+        
+        # Track blind approach distance
+        if self.state == 'APPROACH':
+            dx_traveled = self.local_x - self._blind_approach_start_pos[0]
+            dy_traveled = self.local_y - self._blind_approach_start_pos[1]
+            self._blind_approach_dist_traveled = math.hypot(dx_traveled, dy_traveled)
 
     def image_cb(self, msg: CompressedImage):
         self.has_image = True
@@ -633,11 +589,9 @@ class CubeSorterNode(Node):
         h, w = frame.shape[:2]
         self.img_h, self.img_w = h, w
 
-        # Detect all cubes in frame
         all_obs = self._detect_all_cubes(frame)
         self.all_visible_cubes = all_obs
         
-        # Find best target (closest cube of the target color if approaching)
         best_obs = None
         if not all_obs:
             self.target_visible = False
@@ -646,18 +600,15 @@ class CubeSorterNode(Node):
             self._prev_obs = None
             return
         
-        # If we have a target, look for it specifically
-        if self.approach_target:
+        # If we're approaching a target, prioritize that color
+        if self.approach_target and self.state in ['APPROACH', 'TURN_TO_APPROACH']:
             target_color = self.approach_target.color
             matching = [o for o in all_obs if o['color'] == target_color]
             if matching:
-                # Pick closest matching cube
                 best_obs = min(matching, key=lambda o: o.get('distance', float('inf')))
             else:
-                # No matching cube, pick closest overall
                 best_obs = min(all_obs, key=lambda o: o.get('distance', float('inf')))
         else:
-            # Pick closest cube
             best_obs = min(all_obs, key=lambda o: o.get('distance', float('inf')))
 
         if best_obs is None:
@@ -667,7 +618,6 @@ class CubeSorterNode(Node):
             self._prev_obs = None
             return
 
-        # Temporal stability
         stable = False
         if self._prev_obs and best_obs['color'] == self._prev_obs.get('color'):
             jump = abs(best_obs['cx'] - self._prev_obs['cx'])
@@ -677,7 +627,6 @@ class CubeSorterNode(Node):
         self.target_frames = (self.target_frames + 1) if stable else 1
         self._prev_obs = best_obs
 
-        # EMA filter
         alpha = 0.70
         if self._fcx is None or not stable:
             self._fcx = best_obs['cx']
@@ -694,11 +643,8 @@ class CubeSorterNode(Node):
         best_obs['cy'] = float(self._fcy)
         best_obs['bbox_h'] = int(round(self._fbbox_h))
         best_obs['bbox_w'] = int(round(self._fbbox_w))
-
-        # Update distance estimate
         best_obs['distance'] = self._estimate_distance(self._fbbox_w, self._fbbox_h)
         
-        # Calculate world position
         world_x, world_y = self._cube_position_from_camera(
             self._fcx, self._fcy, best_obs['distance'])
         best_obs['world_x'] = world_x
@@ -717,7 +663,7 @@ class CubeSorterNode(Node):
         if abs(err) > 2.0:
             self.last_turn_dir = -1.0 if err > 0 else 1.0
 
-    # ── colour detection ──────────────────────────────────────────────────────
+    # ── colour detection (unchanged) ──────────────────────────────────────────
 
     def _red_mask(self, hsv, bgr):
         m = cv2.bitwise_or(
@@ -752,7 +698,6 @@ class CubeSorterNode(Node):
                 and mr >= 85 and (mr - mb) >= 48 and (mr - mg) >= 35)
 
     def _detect_all_cubes(self, frame) -> List[dict]:
-        """Detect all cubes in the frame, returning list of observations."""
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, w = frame.shape[:2]
         k    = np.ones((5, 5), np.uint8)
@@ -805,43 +750,28 @@ class CubeSorterNode(Node):
                                        hsv[y:y+bh, x:x+bw], roi_m):
                     continue
 
-                # Estimate distance
                 distance = self._estimate_distance(float(bw), float(bh))
-                
-                # Filter by distance
                 if distance > self.MAX_CUBE_DISTANCE:
                     continue
                 
-                # Calculate world position
                 cx = float(x + bw / 2.0)
                 cy = cy_val
                 world_x, world_y = self._cube_position_from_camera(cx, cy, distance)
                 
-                # Filter by arena boundaries
                 if self.arena and not self.arena.is_within_bounds(world_x, world_y, self.ARENA_BOUNDARY_MARGIN):
                     continue
 
                 obs = {
                     'color': color,
-                    'cx': cx,
-                    'cy': cy,
+                    'cx': cx, 'cy': cy,
                     'area': float(area),
-                    'bbox_h': int(bh),
-                    'bbox_w': int(bw),
+                    'bbox_h': int(bh), 'bbox_w': int(bw),
                     'distance': distance,
-                    'world_x': world_x,
-                    'world_y': world_y
+                    'world_x': world_x, 'world_y': world_y
                 }
                 all_cubes.append(obs)
 
         return all_cubes
-
-    def _detect_cube(self, frame) -> Optional[dict]:
-        """Legacy method - now uses _detect_all_cubes"""
-        cubes = self._detect_all_cubes(frame)
-        if not cubes:
-            return None
-        return min(cubes, key=lambda o: o.get('distance', float('inf')))
 
     # ── state handlers ────────────────────────────────────────────────────────
 
@@ -866,8 +796,7 @@ class CubeSorterNode(Node):
                 front=med(self._init_front), back=med(self._init_back),
                 left=med(self._init_left), right=med(self._init_right))
             print(f'[INIT] Arena: {self.arena.front:.2f}F/{self.arena.back:.2f}B '
-                  f'{self.arena.left:.2f}L/{self.arena.right:.2f}R '
-                  f'({self.arena.width:.2f}x{self.arena.depth:.2f}m)')
+                  f'{self.arena.left:.2f}L/{self.arena.right:.2f}R')
             self._set_state('IDLE', 'Arena mapped. Press s to search.')
             return
 
@@ -881,10 +810,10 @@ class CubeSorterNode(Node):
         self._sweep_accum += abs(delta)
         self._sweep_prev   = self.local_yaw
 
-        # Log all visible cubes (not just the primary target)
+        # Log all visible cubes with their detection angles
         if self.all_visible_cubes:
             for obs in self.all_visible_cubes:
-                yaw = self.local_yaw
+                yaw = self.local_yaw  # CURRENT robot heading when cube is seen
                 color = obs['color']
                 distance = obs.get('distance', 0)
                 world_x = obs.get('world_x', 0)
@@ -901,16 +830,22 @@ class CubeSorterNode(Node):
                 
                 self._sweep_logged.append((yaw, distance))
                 
-                # Determine zone based on ACTUAL cube position, not robot position
+                # Determine zone based on cube position
                 zone = self._get_zone(world_x)
                 correct = self._cube_correct(color, zone)
                 
                 # Check if on center line
                 on_center = abs(world_y - self.CENTER_LINE_Y) < self.CENTER_LINE_DETECT_DIST
                 
+                # CRITICAL: Store the yaw angle (robot's heading) when cube was spotted
                 entry = CubeEntry(
-                    color=color, angle_rad=yaw, zone=zone, correct=correct,
-                    x_pos=world_x, y_pos=world_y, distance=distance,
+                    color=color,
+                    angle_rad=yaw,  # <-- THIS IS THE KEY: robot's heading when cube seen
+                    zone=zone,
+                    correct=correct,
+                    x_pos=world_x,
+                    y_pos=world_y,
+                    distance=distance,
                     on_center_line=on_center
                 )
                 
@@ -922,18 +857,22 @@ class CubeSorterNode(Node):
                 
                 status = 'ON CENTER' if on_center else ('correct' if correct else 'WRONG ZONE')
                 print(f'[SEARCH] {color} at ({world_x:.2f}, {world_y:.2f})m '
-                      f'({distance:.2f}m away) - {zone} ({status})')
+                      f'dist={distance:.2f}m yaw={math.degrees(yaw):.1f}° - {zone} ({status})')
 
         if self._sweep_accum >= 2 * math.pi - self.SWEEP_DONE_TOL:
             self._stop()
-            print(f'[SEARCH] Complete. Correct: {len(self.correct_cubes)}  '
+            print(f'[SEARCH] Complete sweep. Correct: {len(self.correct_cubes)}  '
                   f'Misplaced: {len(self.wrong_cubes)}')
             
-            # Filter to only misplaced cubes not on center line (prioritize these)
+            # Print summary of all found cubes
+            for i, cube in enumerate(self.wrong_cubes):
+                print(f'[SEARCH]   Wrong #{i+1}: {cube.color} at '
+                      f'({cube.x_pos:.2f}, {cube.y_pos:.2f})m, '
+                      f'spotted at yaw={math.degrees(cube.angle_rad):.1f}°')
+            
+            # Prioritize off-center cubes
             misplaced_off_center = [c for c in self.wrong_cubes if not c.on_center_line]
             misplaced_on_center = [c for c in self.wrong_cubes if c.on_center_line]
-            
-            # Reorder: off-center first, then on-center
             self.wrong_cubes = misplaced_off_center + misplaced_on_center
             
             if not self.wrong_cubes:
@@ -941,75 +880,122 @@ class CubeSorterNode(Node):
                 self._set_state('IDLE', 'All cubes correct')
             else:
                 self.approach_target = self.wrong_cubes[0]
+                print(f'[SEARCH] First target: {self.approach_target.color} at '
+                      f'yaw={math.degrees(self.approach_target.angle_rad):.1f}°')
                 self._set_state('TURN_TO_APPROACH',
-                    f'First: {self.approach_target.color} at ({self.approach_target.x_pos:.2f}, {self.approach_target.y_pos:.2f})m')
+                    f'Turning to {math.degrees(self.approach_target.angle_rad):.1f}° for {self.approach_target.color} cube')
             return
 
         self._pub(0.0, self.SWEEP_ANG)
 
     def _do_turn_to_approach(self):
-        err = self._norm(self._turn_target_yaw - self.local_yaw)
+        """Turn to face the recorded angle of the target cube."""
+        if not self.approach_target:
+            print('[TURN] ERROR: No target!')
+            self._set_state('IDLE', 'No target')
+            return
+        
+        # Use the stored angle from when the cube was spotted
+        target_yaw = self.approach_target.angle_rad
+        err = self._norm(target_yaw - self.local_yaw)
+        
+        # Log progress every ~1 second
+        if int(time.monotonic() * 2) % 2 == 0:
+            print(f'[TURN] Turning to {math.degrees(target_yaw):.0f}° | '
+                  f'current={math.degrees(self.local_yaw):.0f}° | '
+                  f'error={math.degrees(err):.1f}°')
+        
         if abs(err) <= self.YAW_TOL:
             self._stop()
-            self._set_state('APPROACH', 'Aligned to cube')
+            print(f'[TURN] Aligned! Facing {math.degrees(self.local_yaw):.1f}°')
+            self._set_state('APPROACH', 'Driving toward cube (may be blind initially)')
             return
+        
+        # Check timeout - if turning too long, start approach anyway
+        turn_duration = time.monotonic() - self._turn_start_time
+        if turn_duration > 8.0:
+            print(f'[TURN] Timeout after {turn_duration:.1f}s - starting approach')
+            self._stop()
+            self._set_state('APPROACH', 'Timeout - starting blind approach')
+            return
+        
         ang = self._clamp_abs(0.8 * err, self.TURN_ANG_MIN, self.TURN_ANG_MAX)
         self._pub(0.0, ang)
 
     def _do_approach(self):
+        """Approach cube - can work blind using odometry if cube not visible."""
         if self._emergency():
             self._stop()
             self._set_state('IDLE', 'Emergency stop')
             return
 
-        if not self.target_visible or self.target_obs is None:
-            if time.monotonic() - self.last_seen_time <= self.LOST_TIMEOUT:
-                self._pub(0.0, self.last_turn_dir * 0.10)
+        # If we can see the cube, use visual servoing
+        if self.target_visible and self.target_obs is not None:
+            self.last_seen_time = time.monotonic()
+            
+            # Check distance for grab
+            distance = self.target_obs.get('distance', float('inf'))
+            
+            if distance <= self.GRAB_DISTANCE:
+                self._stop()
+                print(f'[APPROACH] Close enough! Distance: {distance:.3f}m')
+                self.cube_held = self.approach_target
+                if self.wrong_cubes and self.approach_target in self.wrong_cubes:
+                    self.wrong_cubes.remove(self.approach_target)
+                self._set_state('GRAB_CUBE', f'Grabbing {self.cube_held.color} cube')
                 return
-            self._set_state('IDLE', 'Cube lost')
-            return
+            
+            # Visual servoing
+            if self.img_w is None:
+                return
+            
+            cx_img = self.img_w / 2.0
+            px_err = self.target_obs['cx'] - cx_img
+            err_n = px_err / cx_img
 
-        if self.img_w is None:
+            if abs(px_err) > self.ALIGN_ROTATE_ONLY_PX:
+                ang = self._clamp_abs(-0.35 * err_n, self.ALIGN_ANG_MIN, self.ALIGN_ANG_MAX)
+                self._pub(0.0, ang)
+            else:
+                ang = (0.0 if abs(px_err) <= self.ALIGN_PIXEL_TOL
+                       else self._clamp_abs(-0.22 * err_n, 0.02, 0.10))
+                self._pub(self.DRIVE_SPEED, ang)
+            
             return
-
-        # Check distance for grab
-        distance = self.target_obs.get('distance', float('inf'))
         
-        if distance <= self.GRAB_DISTANCE:
-            self._stop()
-            print(f'[APPROACH] Close enough to grab! Distance: {distance:.3f}m')
-            self.cube_held = self.approach_target
-            if self.wrong_cubes:
-                self.wrong_cubes.pop(0)
-            self._set_state('GRAB_CUBE', f'Grabbing {self.cube_held.color} cube')
-            return
-
-        # Wall safety
+        # BLIND APPROACH: Cube not visible - drive forward based on odometry
+        time_since_seen = time.monotonic() - self.last_seen_time
+        
+        # Check if we've been blind too long
+        if time_since_seen > self.APPROACH_LOST_TIMEOUT:
+            print(f'[APPROACH] Lost cube for {time_since_seen:.1f}s')
+            if self._blind_approach_dist_traveled > self.BLIND_APPROACH_MAX_DIST:
+                print('[APPROACH] Traveled too far blind - giving up')
+                self._set_state('IDLE', 'Cube lost during blind approach')
+                return
+            # If we had visual recently, keep going blind
+            if time_since_seen > 5.0:
+                self._set_state('IDLE', 'Cube lost too long')
+                return
+        
+        # Check wall
         if self._front_blocked():
             self._stop()
-            self._set_state('IDLE', 'Wall blocked')
+            print('[APPROACH] Wall ahead during blind approach')
+            self._set_state('IDLE', 'Wall blocked blind approach')
             return
-
-        # Visual servoing
-        cx_img = self.img_w / 2.0
-        px_err = self.target_obs['cx'] - cx_img
-        err_n = px_err / cx_img
-
-        if abs(px_err) > self.ALIGN_ROTATE_ONLY_PX:
-            ang = self._clamp_abs(-0.35 * err_n, self.ALIGN_ANG_MIN, self.ALIGN_ANG_MAX)
-            self._pub(0.0, ang)
-        else:
-            ang = (0.0 if abs(px_err) <= self.ALIGN_PIXEL_TOL
-                   else self._clamp_abs(-0.22 * err_n, 0.02, 0.10))
-            self._pub(self.DRIVE_SPEED, ang)
+        
+        # Drive forward blind
+        print(f'[APPROACH] Blind: traveled {self._blind_approach_dist_traveled:.2f}m, '
+              f'lost for {time_since_seen:.1f}s')
+        self._pub(self.BLIND_APPROACH_SPEED, 0.0)
 
     def _do_grab_cube(self):
-        """Wait for grab to complete (handled in _set_state entry)"""
-        time.sleep(0.5)  # Give servo time
+        """Wait for grab to complete"""
+        time.sleep(0.5)
         self._set_state('PLAN_DELIVERY', 'Planning delivery path')
 
     def _do_turn_to_deliver(self):
-        """Turn to face the delivery point"""
         dx = self.delivery_x - self.local_x
         dy = self.delivery_y - self.local_y
         target_yaw = math.atan2(dx, dy)
@@ -1024,7 +1010,6 @@ class CubeSorterNode(Node):
         self._pub(0.0, ang)
 
     def _do_deliver(self):
-        """Drive to delivery point on center line"""
         if self._emergency():
             self._stop()
             self._set_state('IDLE', 'Emergency during delivery')
@@ -1036,21 +1021,18 @@ class CubeSorterNode(Node):
         
         y_dist = abs(self.local_y - self.CENTER_LINE_Y)
         
-        # Check if arrived
         if y_dist <= self.CENTER_LINE_TOL:
             self._stop()
-            print(f'[DELIVER] Arrived at center line! Pos: ({self.local_x:.3f}, {self.local_y:.3f})')
+            print(f'[DELIVER] Arrived at center line! ({self.local_x:.3f}, {self.local_y:.3f})')
             self._set_state('RELEASE_CUBE', 'Releasing cube at center line')
             return
         
-        # Wall check
         if self._front_blocked():
             self._stop()
-            print('[DELIVER] Wall blocking delivery - releasing here')
+            print('[DELIVER] Wall blocking delivery')
             self._set_state('RELEASE_CUBE', 'Wall forced early release')
             return
         
-        # Drive toward target
         dx = self.delivery_x - self.local_x
         dy = self.delivery_y - self.local_y
         target_yaw = math.atan2(dx, dy)
@@ -1065,7 +1047,6 @@ class CubeSorterNode(Node):
             self._pub(speed, ang)
 
     def _do_release_cube(self):
-        """Wait for release (handled in _set_state entry)"""
         time.sleep(0.5)
         self.cube_held = None
         self._set_state('TURN_HOME', 'Cube released - returning home')
@@ -1080,6 +1061,14 @@ class CubeSorterNode(Node):
             self._stop()
             self._set_state('RETURN_HOME', 'Facing origin')
             return
+        
+        turn_duration = time.monotonic() - self._turn_start_time
+        if turn_duration > 8.0:
+            print('[TURN_HOME] Timeout - starting return anyway')
+            self._stop()
+            self._set_state('RETURN_HOME', 'Timeout - returning')
+            return
+        
         ang = self._clamp_abs(0.8 * err, self.TURN_ANG_MIN, self.TURN_ANG_MAX)
         self._pub(0.0, ang)
 
@@ -1095,11 +1084,11 @@ class CubeSorterNode(Node):
 
         if dist < self.HOME_ARRIVE_DIST:
             self._stop()
-            print(f'[RETURN] Home. Remaining: {len(self.wrong_cubes)}')
+            print(f'[RETURN] Home. Remaining misplaced: {len(self.wrong_cubes)}')
             if self.wrong_cubes:
                 self.approach_target = self.wrong_cubes[0]
                 self._set_state('TURN_TO_APPROACH',
-                    f'Next: {self.approach_target.color} cube')
+                    f'Next: {self.approach_target.color} at yaw={math.degrees(self.approach_target.angle_rad):.1f}°')
             else:
                 self._set_state('IDLE', 'All cubes placed!')
             return
@@ -1130,24 +1119,15 @@ class CubeSorterNode(Node):
             self._stop()
             return
 
-        # if self.state == 'WAIT_FOR_DATA':
-        #     self._stop()
-        #     self._set_state('INIT_SWEEP', 'Sensors ready')
-        #     return
+        # HARD-CODED ARENA DIMENSIONS
         if self.state == 'WAIT_FOR_DATA':
             self._stop()
-            # Hard-code arena dimensions for testing (in meters)
             self.arena = ArenaMap(
-                front=1.0,   # Distance to front wall
-                back=1.0,    # Distance to back wall
-                left=1.0,    # Distance to left wall
-                right=1.0    # Distance to right wall
+                front=1.0, back=1.0,
+                left=1.0, right=1.0
             )
-            print(f'[INIT] Arena dimensions HARD-CODED for testing:')
-            print(f'      front={self.arena.front:.2f}m back={self.arena.back:.2f}m')
-            print(f'      left={self.arena.left:.2f}m right={self.arena.right:.2f}m')
-            print(f'      width={self.arena.width:.2f}m depth={self.arena.depth:.2f}m')
-            self._set_state('IDLE', 'Arena hard-coded. Press s to start search.')
+            print(f'[INIT] Arena hard-coded: {self.arena.width:.2f}x{self.arena.depth:.2f}m')
+            self._set_state('IDLE', 'Arena ready. Press s to search.')
             return
 
         handlers = {
@@ -1157,7 +1137,7 @@ class CubeSorterNode(Node):
             'TURN_TO_APPROACH': self._do_turn_to_approach,
             'APPROACH':         self._do_approach,
             'GRAB_CUBE':        self._do_grab_cube,
-            'PLAN_DELIVERY':    lambda: None,  # Handled in entry
+            'PLAN_DELIVERY':    lambda: None,
             'TURN_TO_DELIVER':  self._do_turn_to_deliver,
             'DELIVER':          self._do_deliver,
             'RELEASE_CUBE':     self._do_release_cube,
@@ -1182,9 +1162,14 @@ class CubeSorterNode(Node):
             dist_info = f' dist={self.target_obs.get("distance", 0):.2f}m'
         
         held = f' held={self.cube_held.color}' if self.cube_held else ''
+        
+        target_info = ''
+        if self.approach_target and self.state in ['TURN_TO_APPROACH', 'APPROACH']:
+            target_info = f' target_yaw={math.degrees(self.approach_target.angle_rad):.0f}°'
 
         print(f'[STATUS] {self.state} pos=({self.local_x:.2f},{self.local_y:.2f}) '
-              f'F={self.front_dist:.2f}m wrong={len(self.wrong_cubes)}{held}{dist_info}')
+              f'yaw={math.degrees(self.local_yaw):.0f}° '
+              f'F={self.front_dist:.2f}m wrong={len(self.wrong_cubes)}{held}{target_info}{dist_info}')
 
     # ── cleanup ───────────────────────────────────────────────────────────────
 
@@ -1224,4 +1209,4 @@ def main(args=None):
 
 
 if __name__ == '__main__':
-    main()  
+    main()
