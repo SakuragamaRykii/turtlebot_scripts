@@ -42,6 +42,10 @@ FINE_ALIGN_MAX_ANG = 0.09
 APPROACH_SPEED = 0.050
 EXTRA_FORWARD_SPEED = 0.044
 EXTRA_FORWARD_AFTER_LOST_SEC = 1.5
+APPROACH_LOST_GRACE_FRAMES = 6
+CAPTURE_CLOSE_DISTANCE_CM = 28.0
+CAPTURE_CLOSE_BBOX_H_PX = 96
+CAPTURE_CLOSE_BOTTOM_Y_RATIO = 0.68
 
 TURN_AFTER_GRAB_TARGET_DEG = 155.0
 TURN_RETURN_TARGET_DEG = 180.0
@@ -435,6 +439,9 @@ class SimpleCubeMissionV15(Node):
         self.center_seen_frames = 0
         self.grab_color = None
         self.detect_error_count = 0
+        self.approach_lost_frames = 0
+        self.last_seen_target = None
+        self.completed_cycles = 0
 
         self.state = "WAIT_FOR_DATA"
         self.state_enter_time = time.monotonic()
@@ -448,7 +455,7 @@ class SimpleCubeMissionV15(Node):
         print("[BOOT] SimpleCubeMission v15")
         print("[MODE] compressed image only, no imports from old versions")
         print("[FLOW] search -> stop 1s -> backtrack turn 1s -> fine align -> approach")
-        print("[FLOW] target lost close -> forward 1.5s -> servo down -> turn -> release -> backup -> return")
+        print("[FLOW] only close target loss triggers forward 1.5s and servo down")
         print(f"[TARGET] TARGET_COLOR={TARGET_COLOR} PREFER_BLUE={PREFER_BLUE}")
         print(f"[SERVO] UP={SERVO_UP_DUTY} DOWN={SERVO_DOWN_DUTY} BCM={SERVO_GPIO_BCM}")
         print("[CMD] type H then Enter to stop and exit")
@@ -498,8 +505,12 @@ class SimpleCubeMissionV15(Node):
         if new_state == "SEARCH":
             self.center_seen_frames = 0
             self.grab_color = None
+            self.approach_lost_frames = 0
+            self.last_seen_target = None
         if new_state in ("CENTER_STOP", "BACKTRACK_AFTER_CENTER", "FINE_ALIGN"):
             self.center_seen_frames = 0
+        if new_state == "APPROACH":
+            self.approach_lost_frames = 0
         if text:
             print(f"[STATE] {new_state} | {text}")
         else:
@@ -594,6 +605,38 @@ class SimpleCubeMissionV15(Node):
         err = self.target_error_pixels()
         return err is not None and abs(err) <= SEARCH_CENTER_BAND_PX
 
+    def remember_target_for_capture(self):
+        if not self.target_visible or self.target_obs is None:
+            return
+        self.last_seen_target = {
+            "color": self.target_obs.color,
+            "bbox_h": float(self.target_obs.bbox_h),
+            "bottom_y": float(self.target_obs.bbox_y + self.target_obs.bbox_h),
+            "distance_cm": float(self.target_obs.distance_cm),
+            "time": time.monotonic(),
+        }
+
+    def last_target_was_close(self):
+        if self.last_seen_target is None or self.image_height is None:
+            return False
+        distance_cm = self.last_seen_target["distance_cm"]
+        bbox_h = self.last_seen_target["bbox_h"]
+        bottom_y = self.last_seen_target["bottom_y"]
+        close_by_distance = 0.1 < distance_cm <= CAPTURE_CLOSE_DISTANCE_CM
+        close_by_size = bbox_h >= CAPTURE_CLOSE_BBOX_H_PX
+        close_by_bottom = bottom_y >= self.image_height * CAPTURE_CLOSE_BOTTOM_Y_RATIO
+        return close_by_distance or close_by_size or close_by_bottom
+
+    def last_target_summary(self):
+        if self.last_seen_target is None:
+            return "last=none"
+        return (
+            f"last={self.last_seen_target['color']} "
+            f"h={self.last_seen_target['bbox_h']:.0f} "
+            f"bottom={self.last_seen_target['bottom_y']:.0f} "
+            f"dist={self.last_seen_target['distance_cm']:.1f}cm"
+        )
+
     def handle_search(self):
         if self.front_dist <= EMERGENCY_STOP_M:
             self.set_state("STOPPED", "emergency front distance")
@@ -605,6 +648,7 @@ class SimpleCubeMissionV15(Node):
                 self.stop_robot_once()
                 if self.center_seen_frames >= MIN_CENTER_FRAMES:
                     self.grab_color = self.target_obs.color
+                    self.remember_target_for_capture()
                     self.set_state("CENTER_STOP", f"{self.grab_color} centered, stop before correction")
                 return
             self.center_seen_frames = 0
@@ -645,6 +689,7 @@ class SimpleCubeMissionV15(Node):
             self.stop_robot_once()
             if self.center_seen_frames >= FINE_ALIGN_HOLD_FRAMES:
                 self.grab_color = self.target_obs.color
+                self.remember_target_for_capture()
                 self.set_state("APPROACH", f"{self.grab_color} fine aligned, drive straight")
             return
 
@@ -659,9 +704,19 @@ class SimpleCubeMissionV15(Node):
             return
 
         if not self.target_visible or self.target_obs is None:
-            self.set_state("EXTRA_FORWARD_AFTER_LOST", "target disappeared, forward 1.5s")
+            self.approach_lost_frames += 1
+            if self.approach_lost_frames < APPROACH_LOST_GRACE_FRAMES:
+                self.publish_cmd(APPROACH_SPEED * 0.7, 0.0)
+                return
+            if self.last_target_was_close():
+                self.set_state("EXTRA_FORWARD_AFTER_LOST", f"close target disappeared, {self.last_target_summary()}")
+            else:
+                self.stop_robot_once()
+                self.set_state("SEARCH", f"far target lost, no grab, {self.last_target_summary()}")
             return
 
+        self.approach_lost_frames = 0
+        self.remember_target_for_capture()
         self.publish_cmd(APPROACH_SPEED, 0.0)
 
     def handle_extra_forward_after_lost(self):
@@ -710,7 +765,9 @@ class SimpleCubeMissionV15(Node):
         error = self.normalize_angle(self.turn_target_yaw - self.local_yaw)
         if abs(error) <= math.radians(TURN_180_TOL_DEG):
             self.stop_robot_once()
-            self.set_state("SEARCH", "continue searching")
+            self.completed_cycles += 1
+            self.servo.servo_up()
+            self.set_state("SEARCH", f"continue searching, cycles={self.completed_cycles}")
             return
         angular = self.clamp_abs(0.75 * error, 0.05, TURN_RETURN_MAX_ANG)
         self.publish_cmd(0.0, angular)
@@ -774,6 +831,7 @@ class SimpleCubeMissionV15(Node):
         print(
             f"[STATUS] {self.state} {target_text} grab={self.grab_color} "
             f"front={self.front_dist:.3f}m yaw={math.degrees(self.local_yaw):.0f} "
+            f"lost={self.approach_lost_frames} cycles={self.completed_cycles} "
             f"errors={self.detect_error_count} image=compressed {self.image_width}x{self.image_height}"
         )
 
