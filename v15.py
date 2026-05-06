@@ -30,8 +30,8 @@ SEARCH_CENTER_BAND_PX = 80
 MIN_CENTER_FRAMES = 3
 STARTUP_IGNORE_SEC = 0.8
 SEARCH_LOCK_MAX_JUMP_PX = 85
-SEARCH_LOCK_MIN_AREA = 180.0
-SEARCH_LOCK_MIN_BBOX_H = 14
+SEARCH_LOCK_MIN_AREA = 170.0
+SEARCH_LOCK_MIN_BBOX_H = 12
 
 CENTER_STOP_SEC = 1.0
 BACKTRACK_AFTER_CENTER_SEC = 1.0
@@ -47,11 +47,9 @@ APPROACH_SPEED = 0.050
 EXTRA_FORWARD_SPEED = 0.044
 EXTRA_FORWARD_AFTER_LOST_SEC = 1.0
 APPROACH_LOST_GRACE_FRAMES = 6
+MIN_APPROACH_TIME_BEFORE_LOST_GRAB_SEC = 0.8
 CAPTURE_CLOSE_DISTANCE_CM = 20.0
 CAPTURE_CLOSE_BBOX_H_PX = 125
-VISUAL_GRAB_DISTANCE_CM = 17.0
-VISUAL_GRAB_BBOX_H_PX = 150
-VISUAL_GRAB_BOTTOM_Y_RATIO = 0.84
 
 TURN_AFTER_GRAB_TARGET_DEG = 155.0
 TURN_RETURN_TARGET_DEG = 180.0
@@ -91,7 +89,8 @@ MIN_FILL_RATIO = 0.15
 MIN_EXTENT = 0.13
 MIN_SOLIDITY = 0.40
 MIN_CENTER_Y_RATIO = 0.12
-MIN_HOLES_REQUIRED = 1
+RED_MIN_HOLES_REQUIRED = 1
+BLUE_MIN_HOLES_REQUIRED = 0
 
 REAL_CUBE_SIZE_CM = 5.0
 FOCAL_LENGTH_PX = 520.0
@@ -344,7 +343,8 @@ class CubeDetector:
                 continue
 
             holes, hole_pitch = self.detect_holes(roi_gray, shape_mask)
-            if holes < MIN_HOLES_REQUIRED:
+            min_holes = RED_MIN_HOLES_REQUIRED if color == "red" else BLUE_MIN_HOLES_REQUIRED
+            if holes < min_holes:
                 continue
 
             center_error = abs((x + w / 2.0) - self.image_width / 2.0)
@@ -623,8 +623,16 @@ class SimpleCubeMissionV15(Node):
             return False
         if obs.area < SEARCH_LOCK_MIN_AREA or obs.bbox_h < SEARCH_LOCK_MIN_BBOX_H:
             return False
-        if obs.holes <= 0 and (obs.area < 450.0 or obs.bbox_h < 24):
-            return False
+        if obs.color == "red":
+            if obs.holes < 1:
+                return False
+            if obs.area < 220.0 and obs.bbox_h < 18:
+                return False
+        else:
+            if obs.area < 150.0 or obs.bbox_h < 12:
+                return False
+            if obs.holes <= 0 and obs.area < 260.0 and obs.bbox_h < 18:
+                return False
         return True
 
     def update_search_lock(self):
@@ -671,17 +679,6 @@ class SimpleCubeMissionV15(Node):
         close_by_distance = 0.1 < distance_cm <= CAPTURE_CLOSE_DISTANCE_CM
         close_by_size = bbox_h >= CAPTURE_CLOSE_BBOX_H_PX
         return close_by_distance or close_by_size
-
-    def current_target_is_grab_ready(self):
-        if not self.target_visible or self.target_obs is None or self.image_height is None:
-            return False
-        distance_cm = self.target_obs.distance_cm
-        bbox_h = self.target_obs.bbox_h
-        bottom_y = self.target_obs.bbox_y + self.target_obs.bbox_h
-        close_by_distance = 0.1 < distance_cm <= VISUAL_GRAB_DISTANCE_CM
-        close_by_size = bbox_h >= VISUAL_GRAB_BBOX_H_PX
-        close_by_bottom = bottom_y >= self.image_height * VISUAL_GRAB_BOTTOM_Y_RATIO and bbox_h >= 90
-        return close_by_distance or close_by_size or close_by_bottom
 
     def last_target_summary(self):
         if self.last_seen_target is None:
@@ -769,7 +766,7 @@ class SimpleCubeMissionV15(Node):
             if self.approach_lost_frames < APPROACH_LOST_GRACE_FRAMES:
                 self.publish_cmd(APPROACH_SPEED * 0.7, 0.0)
                 return
-            if self.last_target_was_close():
+            if self.state_age() >= MIN_APPROACH_TIME_BEFORE_LOST_GRAB_SEC and self.last_target_was_close():
                 self.set_state("EXTRA_FORWARD_AFTER_LOST", f"close target disappeared, {self.last_target_summary()}")
             else:
                 self.stop_robot_once()
@@ -778,10 +775,6 @@ class SimpleCubeMissionV15(Node):
 
         self.approach_lost_frames = 0
         self.remember_target_for_capture()
-        if self.current_target_is_grab_ready():
-            self.stop_robot_once()
-            self.set_state("SERVO_DOWN", f"target visually close, {self.last_target_summary()}")
-            return
         self.publish_cmd(APPROACH_SPEED, 0.0)
 
     def handle_extra_forward_after_lost(self):
