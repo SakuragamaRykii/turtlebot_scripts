@@ -97,6 +97,22 @@ class CubeSorterNode(Node):
     # ── return-home arrival threshold ────────────────────────────────────────
     HOME_ARRIVE_DIST = 0.15          # m
 
+    # Add new constant near the top of the class
+    GLOBAL_SAFETY_DIST = 0.12          # m – stop everything if any side is this close
+    TURN_SEARCH_TIMEOUT = 10.0         # seconds – max rotation time searching for cube
+  
+    def _check_global_safety(self) -> bool:
+        """
+        Returns True if any LiDAR direction is dangerously close.
+        Called before every motion state.
+        """
+        if (self.front_dist < self.GLOBAL_SAFETY_DIST or
+            self.back_dist  < self.GLOBAL_SAFETY_DIST or
+            self.left_dist  < self.GLOBAL_SAFETY_DIST or
+            self.right_dist < self.GLOBAL_SAFETY_DIST):
+            return True
+        return False
+
     def __init__(self):
         super().__init__('cube_sorter')
 
@@ -493,19 +509,46 @@ class CubeSorterNode(Node):
 
     def _do_turn_to_approach(self):
         if not self.cube_target:
-            self._set_state('IDLE', 'No target'); return
-        err = self._norm(self.cube_target['angle_rad'] - self.local_yaw)
-        if abs(err) <= self.YAW_TOL:
-            self._stop()
-            self._set_state('APPROACH', 'Aligned')
+            self._set_state('IDLE', 'No target')
             return
-        # If cube already visible in center crop, jump directly to approach
-        if self.target_visible and self.target_obs and self.target_obs['color'] == self.cube_target['color']:
+
+        # Timeout to avoid infinite spinning
+        if time.monotonic() - self._state_enter > self.TURN_SEARCH_TIMEOUT:
             self._stop()
-            self._set_state('APPROACH', 'Cube visible')
+            self._set_state('IDLE', 'Turn timeout – cube not found')
             return
-        ang = self._clamp_abs(0.8*err, self.TURN_ANG_MIN, self.TURN_ANG_MAX)
+
+        # If the correct cube is already visible and `CONFIRM_FRAMES` stable, go straight to approach
+        if (self.target_visible and self.target_obs and
+            self.target_obs['color'] == self.cube_target['color'] and
+            self.target_frames >= self.CONFIRM_FRAMES):
+            # Check if it's roughly centred in the centre crop
+            cx = self.target_obs['cx']
+            if abs(cx - self.img_w/2.0) < self.ALIGN_PIXEL_TOL:
+                self._stop()
+                self._set_state('APPROACH', 'Cube acquired')
+                return
+            else:
+                # Still not centred, let visual servoing handle it (stay in TURN_TO_APPROACH)
+                # but we rotate toward the error
+                err = cx - self.img_w/2.0
+                ang = self._clamp_abs(-0.35 * (err / (self.img_w/2.0)),
+                                      self.TURN_ANG_MIN, self.TURN_ANG_MAX)
+                self._pub(0.0, ang)
+                return
+
+        # No cube visible: rotate in the direction of the stored yaw error
+        err_yaw = self._norm(self.cube_target['angle_rad'] - self.local_yaw)
+        # If error is very small, continue rotating slowly (in last seen direction)
+        if abs(err_yaw) < self.YAW_TOL:
+            # Already near the right heading, but no cube → search by rotating slowly
+            self._pub(0.0, math.copysign(0.15, self.last_turn_dir))
+            return
+
+        # Rotate toward stored yaw
+        ang = self._clamp_abs(0.8 * err_yaw, self.TURN_ANG_MIN, self.TURN_ANG_MAX)
         self._pub(0.0, ang)
+        self.last_turn_dir = 1.0 if err_yaw > 0 else -1.0
 
     def _do_approach(self):
         if self._emergency():
@@ -611,6 +654,14 @@ class CubeSorterNode(Node):
     def _do_return_home(self):
         if self._emergency():
             self._stop(); self._set_state('IDLE', 'Emergency'); return
+
+        # Extra wall safety while driving home
+        if self.front_dist <= self.WALL_STOP_DIST:
+            self._stop()
+            print('[RETURN] Wall ahead – stopping')
+            self._set_state('IDLE')
+            return
+
         dx = -self.local_x
         dy = -self.local_y
         dist = math.hypot(dx, dy)
@@ -647,7 +698,6 @@ class CubeSorterNode(Node):
             self._keys = []
             return k
 
-    # ── main control loop ────────────────────────────────────────────────────
     def control_loop(self):
         for k in self._pop_keys():
             if k == 'h':
@@ -668,6 +718,15 @@ class CubeSorterNode(Node):
             print('[INIT] Hard‑coded arena: 2x2 m')
             self._set_state('IDLE')
             return
+
+        # ── GLOBAL SAFETY CHECK ──────────────────────────────────────────────
+        # Stops any motion if something is too close
+        if self.state in ('APPROACH', 'DELIVER', 'RETURN_HOME', 'SEARCH',
+                          'TURN_TO_APPROACH', 'TURN_TO_DELIVER', 'TURN_HOME'):
+            if self._check_global_safety():
+                self._stop()
+                self._set_state('IDLE', 'Obstacle too close – stopped')
+                return
 
         handlers = {
             'IDLE':             self._do_idle,
