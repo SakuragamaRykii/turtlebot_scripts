@@ -1,954 +1,581 @@
 #!/usr/bin/env python3
 """
-TurtleBot3 Cube Sorting State Machine
-For Raspberry Pi 5 with PiCamera, Servo on GPIO12, OpenCR board
+Cube Sorting Robot with Reference-Based Color Detection
+Uses proven HSV+RGB dual masking from working reference code
 """
+
+import math
+import threading
+import time
+from dataclasses import dataclass
+from enum import Enum
+import json
+import os
 
 import cv2
 import numpy as np
-import time
-import threading
-from enum import Enum
-from collections import deque
-import math
-
-# ROS2 imports
 import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CompressedImage, LaserScan
 
-# GPIO imports for servo
 try:
     import RPi.GPIO as GPIO
-    GPIO_AVAILABLE = True
-except ImportError:
-    print("Warning: RPi.GPIO not available - using mock")
-    GPIO_AVAILABLE = False
+except Exception:
+    GPIO = None
 
 # ============================================================================
-# Configuration Constants
+# Reference-Based Color Detection Parameters (from working code)
 # ============================================================================
 
-class Config:
-    # Camera settings
-    CAMERA_WIDTH = 640
-    CAMERA_HEIGHT = 480
-    CAMERA_FPS = 30
+class ColorDetectionConfig:
+    """Exact parameters from the working reference code"""
     
-    # Color detection HSV ranges (tune these based on your lighting)
-    RED_LOWER1 = np.array([0, 100, 100])
-    RED_UPPER1 = np.array([10, 255, 255])
-    RED_LOWER2 = np.array([160, 100, 100])
-    RED_UPPER2 = np.array([180, 255, 255])
+    # Red HSV ranges
+    RED_HSV_LOWER1 = np.array([0, 75, 40], dtype=np.uint8)
+    RED_HSV_UPPER1 = np.array([16, 255, 255], dtype=np.uint8)
+    RED_HSV_LOWER2 = np.array([164, 75, 40], dtype=np.uint8)
+    RED_HSV_UPPER2 = np.array([180, 255, 255], dtype=np.uint8)
     
-    BLUE_LOWER = np.array([100, 100, 100])
-    BLUE_UPPER = np.array([130, 255, 255])
+    # Red RGB constraints (BGR order)
+    RED_R_MIN = 70
+    RED_R_OVER_G = 22
+    RED_R_OVER_B = 26
     
-    # Minimum contour area to consider as cube
-    MIN_CUBE_AREA = 1000
+    # Blue HSV ranges
+    BLUE_HSV_LOWER = np.array([80, 25, 20], dtype=np.uint8)
+    BLUE_HSV_UPPER = np.array([150, 255, 255], dtype=np.uint8)
     
-    # Servo settings
-    SERVO_PIN = 12
-    SERVO_GRASP_ANGLE = 0      # Angle to close gripper
-    SERVO_RELEASE_ANGLE = 90   # Angle to open gripper
-    SERVO_PWM_FREQ = 50        # 50Hz for standard servos
+    # Blue RGB constraints (BGR order)
+    BLUE_B_MIN = 40
+    BLUE_B_OVER_R = 6
+    BLUE_B_OVER_G = -22  # Note: negative means B can be slightly less than G
     
-    # Navigation settings
-    LINEAR_SPEED = 0.15        # m/s
-    ANGULAR_SPEED = 0.5        # rad/s
-    APPROACH_SPEED = 0.08      # Slower approach speed
-    APPROACH_DISTANCE = 0.15   # meters from cube to stop
-    GRASP_DISTANCE = 0.10      # meters
+    # Morphological processing
+    MEDIAN_BLUR_SIZE = 5
+    MORPH_OPEN_KERNEL = (3, 3)
+    MORPH_CLOSE_KERNEL = (7, 7)
+    DILATE_KERNEL = (3, 3)
+    DILATE_ITERATIONS = 1
     
-    # Arena settings (adjust based on your arena dimensions)
-    ARENA_WIDTH = 2.0          # meters
-    ARENA_HEIGHT = 2.0         # meters
+    # Shape filtering
+    MIN_CONTOUR_AREA = 120.0
+    MIN_BBOX_W = 10
+    MIN_BBOX_H = 10
+    MIN_ASPECT = 0.55
+    MAX_ASPECT = 1.75
+    MIN_FILL_RATIO = 0.15
+    MIN_EXTENT = 0.13
+    MIN_SOLIDITY = 0.40
+    MIN_CENTER_Y_RATIO = 0.12
     
-    # Target sides (change based on assignment)
-    TARGET_SIDE = "LEFT"       # or "RIGHT" based on competition assignment
+    # Hole detection (for cube verification)
+    RED_MIN_HOLES = 1
+    BLUE_MIN_HOLES = 0
+    HOLE_ERODE_KERNEL = (5, 5)
+    HOLE_MIN_AREA_RATIO = 0.00015
+    HOLE_MAX_AREA_RATIO = 0.06
+    HOLE_MIN_CIRCULARITY = 0.14
+    HOLE_DARK_PERCENTILE = 30
+    HOLE_MIN_PIXELS_FOR_STATS = 20
     
-    # LiDAR settings
-    FRONT_ANGLES_RANGE = 30    # degrees from center considered "front"
-    WALL_DISTANCE_THRESHOLD = 0.3  # meters
+    # Color signature verification
+    BLUE_HUE_RANGE = (80, 150)
+    BLUE_HUE_MIN_RATIO = 0.18
+    BLUE_MIN_SAT = 25
+    BLUE_MIN_V = 30
+    BLUE_MIN_B = 40
+    BLUE_MIN_B_OVER_R = 5
     
-    # Scan settings
-    SCAN_ROTATION_SPEED = 0.8  # rad/s
-    SCAN_ROTATION_TIME = 2.0   # seconds per quarter rotation
+    RED_HUE_MIN = 0
+    RED_HUE_MAX = 16
+    RED_HUE_MIN2 = 164
+    RED_HUE_MAX2 = 180
+    RED_HUE_MIN_RATIO = 0.25
+    RED_MIN_SAT = 65
+    RED_MIN_V = 40
+    RED_MIN_R = 65
+    RED_MIN_R_OVER_B = 20
+    RED_MIN_R_OVER_G = 16
     
-    # Debug
-    DEBUG = True
-    SHOW_CAMERA = True         # Set False if no display connected
+    # Distance estimation
+    REAL_CUBE_SIZE_CM = 5.0
+    FOCAL_LENGTH_PX = 520.0
 
 
-# ============================================================================
-# State Machine States
-# ============================================================================
-
-class RobotState(Enum):
-    INIT = "INIT"
-    SCANNING = "SCANNING"
-    APPROACHING = "APPROACHING"
-    IDENTIFYING = "IDENTIFYING"
-    GRASPING = "GRASPING"
-    NAVIGATING_TO_TARGET = "NAVIGATING_TO_TARGET"
-    VERIFYING_BOUNDARY = "VERIFYING_BOUNDARY"
-    RELEASING = "RELEASING"
-    COUNTING = "COUNTING"
-    FINISHED = "FINISHED"
-    ERROR = "ERROR"
-
-
-# ============================================================================
-# Servo Controller
-# ============================================================================
-
-class ServoController:
-    """Controls the servo motor for the gripper arm"""
-    
-    def __init__(self, pin=Config.SERVO_PIN):
-        self.pin = pin
-        self.is_initialized = False
-        
-        if GPIO_AVAILABLE:
-            try:
-                GPIO.setmode(GPIO.BCM)
-                GPIO.setup(self.pin, GPIO.OUT)
-                self.pwm = GPIO.PWM(self.pin, Config.SERVO_PWM_FREQ)
-                self.pwm.start(0)
-                self.is_initialized = True
-                print(f"Servo initialized on GPIO pin {self.pin}")
-            except Exception as e:
-                print(f"Failed to initialize servo: {e}")
-    
-    def set_angle(self, angle):
-        """Set servo angle (0-180)"""
-        if not self.is_initialized:
-            print(f"[MOCK] Servo angle set to: {angle}°")
-            return
-        
-        # Convert angle to duty cycle (typical: 2-12% for 0-180 degrees)
-        duty = 2 + (angle / 18)
-        self.pwm.ChangeDutyCycle(duty)
-        time.sleep(0.3)  # Allow servo to move
-        self.pwm.ChangeDutyCycle(0)  # Stop signal to prevent jitter
-        
-        print(f"Servo moved to {angle}°")
-    
-    def grasp(self):
-        """Close gripper to grasp cube"""
-        self.set_angle(Config.SERVO_GRASP_ANGLE)
-        time.sleep(1.0)  # Allow grip to secure
-    
-    def release(self):
-        """Open gripper to release cube"""
-        self.set_angle(Config.SERVO_RELEASE_ANGLE)
-        time.sleep(1.0)
-    
-    def cleanup(self):
-        """Clean up GPIO resources"""
-        if self.is_initialized:
-            self.pwm.stop()
-            GPIO.cleanup()
+@dataclass
+class CubeObservation:
+    """Data class for cube detection results"""
+    color: str
+    cx: float
+    cy: float
+    area: float
+    bbox_x: int
+    bbox_y: int
+    bbox_w: int
+    bbox_h: int
+    holes: int
+    hole_pitch: float
+    fill_ratio: float
+    extent: float
+    solidity: float
+    color_conf: float
+    score: float
+    distance_cm: float = 0.0
 
 
-# ============================================================================
-# Cube Detector using OpenCV
-# ============================================================================
-
-class CubeDetector:
-    """Detects and identifies red and blue cubes using PiCamera via cv2"""
+class ReferenceCubeDetector:
+    """
+    Cube detector using proven HSV+RGB dual masking from reference code.
+    This should match the color detection performance of the working robot.
+    """
     
     def __init__(self):
-        self.camera = None
-        self.frame = None
-        self.running = False
-        self.camera_thread = None
-        
-    def start_camera(self):
-        """Initialize the PiCamera using cv2"""
-        try:
-            # For Raspberry Pi camera, usually /dev/video0
-            self.camera = cv2.VideoCapture(0)
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, Config.CAMERA_WIDTH)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.CAMERA_HEIGHT)
-            self.camera.set(cv2.CAP_PROP_FPS, Config.CAMERA_FPS)
-            
-            if not self.camera.isOpened():
-                raise Exception("Failed to open camera")
-            
-            self.running = True
-            self.camera_thread = threading.Thread(target=self._camera_loop)
-            self.camera_thread.daemon = True
-            self.camera_thread.start()
-            
-            print("Camera initialized successfully")
-            return True
-            
-        except Exception as e:
-            print(f"Camera initialization error: {e}")
-            return False
+        self.image_width = 0
+        self.image_height = 0
+        self.focal_length_px = ColorDetectionConfig.FOCAL_LENGTH_PX
+        self.cfg = ColorDetectionConfig()
     
-    def _camera_loop(self):
-        """Continuous camera capture thread"""
-        while self.running:
-            ret, frame = self.camera.read()
-            if ret:
-                self.frame = frame
-    
-    def get_frame(self):
-        """Get the latest camera frame"""
-        if self.frame is not None:
-            return self.frame.copy()
-        return None
-    
-    def detect_cubes(self, frame=None):
-        """
-        Detect red and blue cubes in the frame
-        Returns: list of dicts with 'color', 'contour', 'center', 'area'
-        """
-        if frame is None:
-            frame = self.get_frame()
-        
-        if frame is None:
-            return []
-        
-        # Convert to HSV for color detection
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # Detect red (two ranges due to HSV wrap-around)
-        red_mask1 = cv2.inRange(hsv, Config.RED_LOWER1, Config.RED_UPPER1)
-        red_mask2 = cv2.inRange(hsv, Config.RED_LOWER2, Config.RED_UPPER2)
-        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-        
-        # Detect blue
-        blue_mask = cv2.inRange(hsv, Config.BLUE_LOWER, Config.BLUE_UPPER)
-        
-        # Find cubes
-        cubes = []
-        
-        for mask, color in [(red_mask, "RED"), (blue_mask, "BLUE")]:
-            # Morphological operations to reduce noise
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            
-            # Find contours
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > Config.MIN_CUBE_AREA:
-                    # Get centroid
-                    M = cv2.moments(contour)
-                    if M["m00"] != 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                    else:
-                        cx, cy = 0, 0
-                    
-                    # Get bounding box
-                    x, y, w, h = cv2.boundingRect(contour)
-                    
-                    cubes.append({
-                        'color': color,
-                        'contour': contour,
-                        'center': (cx, cy),
-                        'area': area,
-                        'bbox': (x, y, w, h)
-                    })
-        
-        # Sort by area (largest first - likely closest)
-        cubes.sort(key=lambda c: c['area'], reverse=True)
-        
-        return cubes
-    
-    def draw_detections(self, frame, cubes):
-        """Draw bounding boxes and labels on frame"""
-        for cube in cubes:
-            x, y, w, h = cube['bbox']
-            color = (0, 0, 255) if cube['color'] == "RED" else (255, 0, 0)
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            cv2.putText(frame, f"{cube['color']} Cube", (x, y-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            cv2.circle(frame, cube['center'], 5, color, -1)
-        return frame
-    
-    def stop_camera(self):
-        """Stop camera capture"""
-        self.running = False
-        if self.camera_thread:
-            self.camera_thread.join(timeout=1.0)
-        if self.camera:
-            self.camera.release()
-
-
-# ============================================================================
-# Main Robot Controller
-# ============================================================================
-
-class CubeSortingRobot(Node):
-    """Main robot controller implementing the state machine"""
-    
-    def __init__(self):
-        super().__init__('cube_sorting_robot')
-        
-        # Initialize components
-        self.servo = ServoController()
-        self.detector = CubeDetector()
-        
-        # State machine
-        self.state = RobotState.INIT
-        self.previous_state = None
-        
-        # Robot pose estimation (simple odometry-based)
-        self.pose = {'x': 0.0, 'y': 0.0, 'theta': 0.0}
-        self.arena_boundaries = None
-        
-        # Cube tracking
-        self.current_cube = None
-        self.cubes_processed = []
-        self.cubes_placed = {'RED': 0, 'BLUE': 0}
-        self.total_cubes_to_place = 4  # 2 red + 2 blue
-        
-        # LiDAR data
-        self.lidar_data = None
-        self.min_front_distance = float('inf')
-        
-        # Flags
-        self.running = True
-        self.scan_angle_covered = 0.0
-        self.approach_start_time = None
-        self.navigation_target = None
-        
-        # Set up ROS publishers and subscribers
-        self.setup_ros()
-        
-        # Start camera
-        self.detector.start_camera()
-        
-        print("Cube Sorting Robot initialized")
-        print(f"Target side: {Config.TARGET_SIDE}")
-    
-    def setup_ros(self):
-        """Set up ROS2 publishers and subscribers"""
-        # Publisher for robot velocity
-        self.cmd_vel_pub = self.create_publisher(
-            Twist, 
-            '/cmd_vel', 
-            10
+    def build_red_mask(self, hsv, bgr):
+        """Build red mask using HSV+RGBT dual approach (from reference)"""
+        # HSV masking (two ranges for red)
+        hsv_mask = cv2.bitwise_or(
+            cv2.inRange(hsv, self.cfg.RED_HSV_LOWER1, self.cfg.RED_HSV_UPPER1),
+            cv2.inRange(hsv, self.cfg.RED_HSV_LOWER2, self.cfg.RED_HSV_UPPER2),
         )
         
-        # Subscriber for LiDAR data
-        self.lidar_sub = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.lidar_callback,
-            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
-        )
+        # RGB dominance check
+        b = bgr[:, :, 0].astype(np.int16)
+        g = bgr[:, :, 1].astype(np.int16)
+        r = bgr[:, :, 2].astype(np.int16)
+        rgb_mask = np.zeros_like(hsv_mask)
+        rgb_mask[(r >= self.cfg.RED_R_MIN) & 
+                 (r > g + self.cfg.RED_R_OVER_G) & 
+                 (r > b + self.cfg.RED_R_OVER_B)] = 255
         
-        # Subscriber for odometry (if available)
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            10
-        )
-        
-        # Timer for main control loop (10Hz)
-        self.control_timer = self.create_timer(0.1, self.control_loop)
+        # Combine both masks
+        return cv2.bitwise_and(hsv_mask, rgb_mask)
     
-    def lidar_callback(self, msg):
-        """Process LiDAR data"""
-        self.lidar_data = msg
+    def build_blue_mask(self, hsv, bgr):
+        """Build blue mask using HSV+RGB dual approach (from reference)"""
+        # HSV masking
+        hsv_mask = cv2.inRange(hsv, self.cfg.BLUE_HSV_LOWER, self.cfg.BLUE_HSV_UPPER)
         
-        # Calculate minimum distance in front
-        front_angles = len(msg.ranges) // 2
-        angle_range = Config.FRONT_ANGLES_RANGE * len(msg.ranges) // 360
+        # RGB dominance check
+        b = bgr[:, :, 0].astype(np.int16)
+        g = bgr[:, :, 1].astype(np.int16)
+        r = bgr[:, :, 2].astype(np.int16)
+        rgb_mask = np.zeros_like(hsv_mask)
+        rgb_mask[(b >= self.cfg.BLUE_B_MIN) & 
+                 (b > r + self.cfg.BLUE_B_OVER_R) & 
+                 (b > g + self.cfg.BLUE_B_OVER_G)] = 255
         
-        start_idx = front_angles - angle_range
-        end_idx = front_angles + angle_range
-        
-        # Filter valid ranges
-        front_ranges = []
-        for i in range(start_idx, end_idx):
-            idx = i % len(msg.ranges)
-            if msg.range_min < msg.ranges[idx] < msg.range_max:
-                front_ranges.append(msg.ranges[idx])
-        
-        self.min_front_distance = min(front_ranges) if front_ranges else float('inf')
+        # OR combination for blue (more permissive)
+        return cv2.bitwise_or(hsv_mask, rgb_mask)
     
-    def odom_callback(self, msg):
-        """Update robot pose from odometry"""
-        # This is simplified - you might want to track orientation properly
-        self.pose['x'] = msg.pose.pose.position.x
-        self.pose['y'] = msg.pose.pose.position.y
-        
-        # Extract yaw from quaternion (simplified)
-        q = msg.pose.pose.orientation
-        self.pose['theta'] = 2 * math.atan2(q.z, q.w)
+    def preprocess_mask(self, mask):
+        """Apply morphological operations to clean up mask (from reference)"""
+        mask = cv2.medianBlur(mask, self.cfg.MEDIAN_BLUR_SIZE)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, 
+                                np.ones(self.cfg.MORPH_OPEN_KERNEL, np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, 
+                                np.ones(self.cfg.MORPH_CLOSE_KERNEL, np.uint8))
+        mask = cv2.dilate(mask, 
+                         np.ones(self.cfg.DILATE_KERNEL, np.uint8), 
+                         iterations=self.cfg.DILATE_ITERATIONS)
+        return mask
     
-    def publish_velocity(self, linear, angular):
-        """Publish velocity command"""
-        twist = Twist()
-        twist.linear.x = linear
-        twist.angular.z = angular
-        self.cmd_vel_pub.publish(twist)
-    
-    def stop_robot(self):
-        """Stop the robot"""
-        self.publish_velocity(0.0, 0.0)
-    
-    def control_loop(self):
-        """Main control loop - executes current state"""
-        if not self.running:
-            return
+    def detect_holes(self, gray_roi, shape_mask_roi):
+        """Detect holes (indentations) characteristic of cubes (from reference)"""
+        if gray_roi.size == 0 or shape_mask_roi.size == 0:
+            return 0, 0.0
         
-        # Execute current state function
-        state_function = getattr(self, f'state_{self.state.value.lower()}', None)
-        if state_function:
-            state_function()
-        else:
-            print(f"Unknown state: {self.state}")
-            self.transition_to(RobotState.ERROR)
-    
-    def transition_to(self, new_state):
-        """Transition to a new state"""
-        self.previous_state = self.state
-        self.state = new_state
-        print(f"\n{'='*50}")
-        print(f"STATE TRANSITION: {self.previous_state} -> {new_state}")
-        print(f"{'='*50}\n")
-    
-    # ========================================================================
-    # State: INIT
-    # ========================================================================
-    
-    def state_init(self):
-        """Initialize robot and start scanning"""
-        print("Initializing robot systems...")
+        # Create inner mask to avoid edge artifacts
+        inner_mask = cv2.erode(shape_mask_roi, 
+                               np.ones(self.cfg.HOLE_ERODE_KERNEL, np.uint8), 
+                               iterations=1)
+        valid_pixels = gray_roi[inner_mask > 0]
         
-        # Perform LiDAR calibration - map arena
-        self.map_arena()
+        if valid_pixels.size < self.cfg.HOLE_MIN_PIXELS_FOR_STATS:
+            return 0, 0.0
         
-        # Move to neutral position
-        self.servo.release()
-        time.sleep(1.0)
+        # Adaptive dark threshold
+        dark_threshold = int(np.clip(
+            np.percentile(valid_pixels, self.cfg.HOLE_DARK_PERCENTILE), 18, 130
+        ))
         
-        print("Initialization complete")
-        self.transition_to(RobotState.SCANNING)
-    
-    def map_arena(self):
-        """Use LiDAR to estimate arena boundaries"""
-        print("Mapping arena...")
+        # Find dark regions
+        dark_mask = cv2.inRange(gray_roi, 0, dark_threshold)
+        dark_mask = cv2.bitwise_and(dark_mask, inner_mask)
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, 
+                                     np.ones((3, 3), np.uint8))
         
-        # Rotate 360 degrees to get wall distances
-        self.publish_velocity(0.0, Config.SCAN_ROTATION_SPEED)
-        time.sleep(6.28 / Config.SCAN_ROTATION_SPEED)  # Time for full rotation
-        self.stop_robot()
+        contours, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, 
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        mask_area = max(float(np.count_nonzero(inner_mask)), 1.0)
+        points = []
         
-        # Store arena boundaries based on initial position
-        # Assuming robot starts in center (0,0,0)
-        if self.lidar_data:
-            ranges = self.lidar_data.ranges
-            num_ranges = len(ranges)
-            
-            # Estimate distances in 4 directions
-            front = min(ranges[num_ranges//4:3*num_ranges//4])
-            right = min(ranges[0:num_ranges//4] + ranges[3*num_ranges//4:])
-            back = min(ranges[3*num_ranges//4:])
-            left = min(ranges[num_ranges//2:num_ranges//4:-1])
-            
-            self.arena_boundaries = {
-                'front': front,
-                'back': back,
-                'left': left,
-                'right': right
-            }
-            
-            print(f"Arena boundaries estimated: {self.arena_boundaries}")
-    
-    # ========================================================================
-    # State: SCANNING
-    # ========================================================================
-    
-    def state_scanning(self):
-        """Scan environment for cubes"""
-        # Rotate in place to search for cubes
-        self.publish_velocity(0.0, Config.SCAN_ROTATION_SPEED * 0.5)
-        
-        # Check camera for cubes
-        frame = self.detector.get_frame()
-        if frame is not None:
-            cubes = self.detector.detect_cubes(frame)
-            
-            # Debug display
-            if Config.SHOW_CAMERA and Config.DEBUG:
-                debug_frame = self.detector.draw_detections(frame.copy(), cubes)
-                cv2.imshow("Cube Detection", debug_frame)
-                cv2.waitKey(1)
-            
-            # If cube found and not already processed
-            for cube in cubes:
-                # Check if this cube was already processed (simple position check)
-                if not self._is_cube_processed(cube):
-                    self.current_cube = cube
-                    print(f"Found new {cube['color']} cube at {cube['center']}")
-                    self.transition_to(RobotState.APPROACHING)
-                    return
-        
-        # Increment scan angle
-        self.scan_angle_covered += Config.SCAN_ROTATION_SPEED * 0.5 * 0.1
-        if self.scan_angle_covered > 2 * math.pi:
-            # Completed full scan without finding new cubes
-            print("Scan complete - no new cubes found")
-            self.scan_angle_covered = 0.0
-            self.transition_to(RobotState.COUNTING)
-    
-    def _is_cube_processed(self, cube):
-        """Check if cube was already processed"""
-        for processed in self.cubes_processed:
-            # Simple distance check (would be better with world coordinates)
-            dist = math.sqrt(
-                (cube['center'][0] - processed['center'][0])**2 +
-                (cube['center'][1] - processed['center'][1])**2
-            )
-            if dist < 50:  # pixels
-                return True
-        return False
-    
-    # ========================================================================
-    # State: APPROACHING
-    # ========================================================================
-    
-    def state_approaching(self):
-        """Approach the detected cube"""
-        if self.current_cube is None:
-            self.transition_to(RobotState.SCANNING)
-            return
-        
-        # Get current frame
-        frame = self.detector.get_frame()
-        if frame is None:
-            return
-        
-        # Detect cube in current frame
-        cubes = self.detector.detect_cubes(frame)
-        matching_cube = None
-        
-        # Find the same cube
-        for cube in cubes:
-            if cube['color'] == self.current_cube['color']:
-                # Check if it's the same cube (based on position proximity)
-                dist = math.sqrt(
-                    (cube['center'][0] - self.current_cube['center'][0])**2 +
-                    (cube['center'][1] - self.current_cube['center'][1])**2
-                )
-                if dist < 100:  # pixels
-                    matching_cube = cube
-                    break
-        
-        if matching_cube is None:
-            print("Lost track of cube, returning to scan")
-            self.transition_to(RobotState.SCANNING)
-            return
-        
-        # Update current cube info
-        self.current_cube = matching_cube
-        
-        # Visual servoing - center cube in frame
-        frame_center_x = Config.CAMERA_WIDTH // 2
-        cube_center_x = matching_cube['center'][0]
-        error_x = cube_center_x - frame_center_x
-        
-        # Proportional control for centering
-        angular_vel = -0.002 * error_x
-        angular_vel = max(-Config.ANGULAR_SPEED, min(Config.ANGULAR_SPEED, angular_vel))
-        
-        # Move forward if cube is centered
-        if abs(error_x) < 30:  # Within 30 pixels of center
-            # Check LiDAR distance for precise approach
-            if self.min_front_distance > Config.APPROACH_DISTANCE:
-                self.publish_velocity(Config.APPROACH_SPEED, angular_vel)
-            else:
-                # Close enough to identify and grasp
-                self.stop_robot()
-                print(f"Close enough to cube ({self.min_front_distance:.2f}m)")
-                self.transition_to(RobotState.IDENTIFYING)
-        else:
-            # Adjust orientation
-            self.publish_velocity(0.0, angular_vel)
-        
-        # Debug display
-        if Config.SHOW_CAMERA and Config.DEBUG:
-            debug_frame = self.detector.draw_detections(frame.copy(), [matching_cube])
-            cv2.line(debug_frame, (frame_center_x, 0), (frame_center_x, Config.CAMERA_HEIGHT), 
-                    (0, 255, 0), 1)
-            cv2.imshow("Approaching Cube", debug_frame)
-            cv2.waitKey(1)
-    
-    # ========================================================================
-    # State: IDENTIFYING
-    # ========================================================================
-    
-    def state_identifying(self):
-        """Confirm cube color before grasping"""
-        if self.current_cube is None:
-            self.transition_to(RobotState.SCANNING)
-            return
-        
-        # Take multiple samples to confirm color
-        confirmed_color = self._confirm_cube_color()
-        
-        if confirmed_color:
-            self.current_cube['color'] = confirmed_color
-            print(f"Cube color confirmed: {confirmed_color}")
-            self.transition_to(RobotState.GRASPING)
-        else:
-            print("Could not confirm cube color")
-            self.transition_to(RobotState.SCANNING)
-    
-    def _confirm_cube_color(self, samples=5):
-        """Take multiple samples to confirm cube color"""
-        color_votes = {"RED": 0, "BLUE": 0}
-        
-        for _ in range(samples):
-            frame = self.detector.get_frame()
-            if frame is None:
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            # Filter by size relative to mask
+            if area < max(4.0, self.cfg.HOLE_MIN_AREA_RATIO * mask_area):
+                continue
+            if area > self.cfg.HOLE_MAX_AREA_RATIO * mask_area:
                 continue
             
-            cubes = self.detector.detect_cubes(frame)
-            if cubes:
-                # Take the largest cube in view
-                largest = max(cubes, key=lambda c: c['area'])
-                color_votes[largest['color']] += 1
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter <= 1e-6:
+                continue
             
-            time.sleep(0.2)
+            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+            if circularity < self.cfg.HOLE_MIN_CIRCULARITY:
+                continue
+            
+            moments = cv2.moments(cnt)
+            if moments["m00"] == 0:
+                continue
+            
+            points.append((
+                float(moments["m10"] / moments["m00"]),
+                float(moments["m01"] / moments["m00"])
+            ))
         
-        # Return color with majority vote
-        if color_votes["RED"] > color_votes["BLUE"]:
-            return "RED"
-        elif color_votes["BLUE"] > color_votes["RED"]:
-            return "BLUE"
+        # Calculate hole pitch (distance between holes)
+        if len(points) < 2:
+            return len(points), 0.0
+        
+        arr = np.array(points, dtype=np.float32)
+        nearest = []
+        for i in range(len(arr)):
+            d = np.linalg.norm(arr - arr[i], axis=1)
+            d = d[d > 1.0]  # Avoid zero distance to self
+            if d.size > 0:
+                nearest.append(float(np.min(d)))
+        
+        return len(points), float(np.median(nearest)) if nearest else 0.0
+    
+    def color_signature(self, color, roi_bgr, roi_hsv, roi_mask):
+        """Verify color consistency in detected region (from reference)"""
+        pixels = roi_bgr[roi_mask > 0]
+        hsv_pixels = roi_hsv[roi_mask > 0]
+        
+        if pixels.size == 0 or hsv_pixels.size == 0:
+            return False, 0.0
+        
+        mean_b, mean_g, mean_r = np.mean(pixels, axis=0)
+        _, mean_s, mean_v = np.mean(hsv_pixels, axis=0)
+        hue = hsv_pixels[:, 0]
+        sat = hsv_pixels[:, 1]
+        
+        if color == "blue":
+            hue_ratio = float(np.mean(
+                (hue >= self.cfg.BLUE_HUE_RANGE[0]) & 
+                (hue <= self.cfg.BLUE_HUE_RANGE[1]) & 
+                (sat >= self.cfg.BLUE_MIN_SAT)
+            ))
+            dom_br = float(mean_b - mean_r)
+            dom_bg = float(mean_b - mean_g)
+            
+            conf = 0.25 * mean_s + 0.35 * dom_br + 0.15 * dom_bg + 90.0 * hue_ratio
+            ok = (hue_ratio >= self.cfg.BLUE_HUE_MIN_RATIO and 
+                  mean_v >= self.cfg.BLUE_MIN_V and 
+                  mean_b >= self.cfg.BLUE_MIN_B and 
+                  dom_br >= self.cfg.BLUE_MIN_B_OVER_R)
+            
+            return ok, float(conf)
+        
+        else:  # red
+            hue_ratio = float(np.mean(
+                ((hue <= self.cfg.RED_HUE_MAX) | (hue >= self.cfg.RED_HUE_MIN2)) & 
+                (sat >= self.cfg.RED_MIN_SAT)
+            ))
+            dom_rb = float(mean_r - mean_b)
+            dom_rg = float(mean_r - mean_g)
+            
+            conf = 0.25 * mean_s + 0.35 * dom_rb + 0.25 * dom_rg + 90.0 * hue_ratio
+            ok = (hue_ratio >= self.cfg.RED_HUE_MIN_RATIO and 
+                  mean_s >= self.cfg.RED_MIN_SAT and 
+                  mean_v >= self.cfg.RED_MIN_V and 
+                  mean_r >= self.cfg.RED_MIN_R and 
+                  dom_rb >= self.cfg.RED_MIN_R_OVER_B and 
+                  dom_rg >= self.cfg.RED_MIN_R_OVER_G)
+            
+            return ok, float(conf)
+    
+    def estimate_distance_cm(self, obs):
+        """Estimate distance to cube based on apparent size"""
+        apparent_size_px = (obs.bbox_w + obs.bbox_h) / 2.0
+        if apparent_size_px <= 0:
+            return 0.0
+        return float(self.cfg.REAL_CUBE_SIZE_CM * self.focal_length_px / apparent_size_px)
+    
+    def detect_best_for_color(self, color, color_mask, frame, hsv, gray):
+        """Find the best cube candidate for a given color (from reference)"""
+        mask = self.preprocess_mask(color_mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < self.cfg.MIN_CONTOUR_AREA:
+                continue
+            
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < self.cfg.MIN_BBOX_W or h < self.cfg.MIN_BBOX_H:
+                continue
+            if w > self.image_width * 0.45 or h > self.image_height * 0.60:
+                continue
+            
+            cy = y + h / 2.0
+            if cy < self.image_height * self.cfg.MIN_CENTER_Y_RATIO:
+                continue
+            
+            aspect = w / float(h)
+            if aspect < self.cfg.MIN_ASPECT or aspect > self.cfg.MAX_ASPECT:
+                continue
+            
+            bbox_area = float(w * h)
+            hull = cv2.convexHull(contour)
+            solidity = float(area / max(cv2.contourArea(hull), 1.0))
+            if solidity < self.cfg.MIN_SOLIDITY:
+                continue
+            
+            shifted = contour - np.array([[x, y]])
+            shape_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(shape_mask, [shifted], -1, 255, thickness=-1)
+            fill_ratio = float(np.count_nonzero(shape_mask) / max(bbox_area, 1.0))
+            extent = float(area / max(bbox_area, 1.0))
+            
+            if fill_ratio < self.cfg.MIN_FILL_RATIO or extent < self.cfg.MIN_EXTENT:
+                continue
+            
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.035 * peri, True)
+            if len(approx) < 4 or len(approx) > 12:
+                continue
+            
+            roi_bgr = frame[y:y + h, x:x + w]
+            roi_hsv = hsv[y:y + h, x:x + w]
+            roi_gray = gray[y:y + h, x:x + w]
+            color_ok, color_conf = self.color_signature(color, roi_bgr, roi_hsv, shape_mask)
+            if not color_ok:
+                continue
+            
+            holes, hole_pitch = self.detect_holes(roi_gray, shape_mask)
+            min_holes = self.cfg.RED_MIN_HOLES if color == "red" else self.cfg.BLUE_MIN_HOLES
+            if holes < min_holes:
+                continue
+            
+            center_error = abs((x + w / 2.0) - self.image_width / 2.0)
+            # Scoring function from reference
+            score = (
+                1.7 * area +
+                420.0 * fill_ratio +
+                320.0 * extent +
+                240.0 * solidity +
+                2.2 * color_conf +
+                80.0 * min(holes, 12) +
+                3.0 * hole_pitch -
+                0.16 * center_error
+            )
+            
+            obs = CubeObservation(
+                color=color,
+                cx=x + w / 2.0,
+                cy=cy,
+                area=area,
+                bbox_x=x,
+                bbox_y=y,
+                bbox_w=w,
+                bbox_h=h,
+                holes=holes,
+                hole_pitch=hole_pitch,
+                fill_ratio=fill_ratio,
+                extent=extent,
+                solidity=solidity,
+                color_conf=color_conf,
+                score=score,
+            )
+            obs.distance_cm = self.estimate_distance_cm(obs)
+            
+            if best is None or obs.score > best.score:
+                best = obs
+        
+        return best
+    
+    def detect(self, frame):
+        """Main detection method - returns best cube (from reference)"""
+        self.image_height, self.image_width = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Detect both colors
+        red_best = self.detect_best_for_color(
+            "red", self.build_red_mask(hsv, frame), frame, hsv, gray
+        ) if TARGET_COLOR in ("any", "red") else None
+        
+        blue_best = self.detect_best_for_color(
+            "blue", self.build_blue_mask(hsv, frame), frame, hsv, gray
+        ) if TARGET_COLOR in ("any", "blue") else None
+        
+        # Return based on target preference
+        if TARGET_COLOR == "red":
+            return red_best, red_best, blue_best
+        if TARGET_COLOR == "blue":
+            return blue_best, red_best, blue_best
+        
+        # For "any" target, prefer based on PREFER_BLUE setting
+        if red_best is not None and blue_best is not None:
+            chosen = blue_best if PREFER_BLUE and blue_best.score >= red_best.score else red_best
         else:
-            return None
+            chosen = blue_best if blue_best is not None else red_best
+        
+        return chosen, red_best, blue_best
     
-    # ========================================================================
-    # State: GRASPING
-    # ========================================================================
-    
-    def state_grasping(self):
-        """Execute grasping sequence"""
-        if self.current_cube is None:
-            self.transition_to(RobotState.SCANNING)
-            return
+    def draw_debug(self, frame, chosen, red_obs, blue_obs):
+        """Draw detection visualization for debugging"""
+        debug_frame = frame.copy()
         
-        print(f"Attempting to grasp {self.current_cube['color']} cube")
+        # Draw red detection
+        if red_obs is not None:
+            x, y, w, h = red_obs.bbox_x, red_obs.bbox_y, red_obs.bbox_w, red_obs.bbox_h
+            cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+            cv2.putText(debug_frame, f"RED s={red_obs.score:.0f} h={red_obs.holes}", 
+                       (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         
-        # Approach a bit more
-        if hasattr(self, 'was_moving_for_grasp'):
-            # Already moved forward, now grasp
-            pass
-        else:
-            self.was_moving_for_grasp = True
-            # Small forward movement
-            self.publish_velocity(0.05, 0.0)
-            time.sleep(1.0)
-            self.stop_robot()
+        # Draw blue detection
+        if blue_obs is not None:
+            x, y, w, h = blue_obs.bbox_x, blue_obs.bbox_y, blue_obs.bbox_w, blue_obs.bbox_h
+            cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            cv2.putText(debug_frame, f"BLUE s={blue_obs.score:.0f} h={blue_obs.holes}", 
+                       (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
         
-        # Execute grasp
-        self.servo.grasp()
-        time.sleep(1.0)
+        # Highlight chosen cube
+        if chosen is not None:
+            x, y, w, h = chosen.bbox_x, chosen.bbox_y, chosen.bbox_w, chosen.bbox_h
+            cv2.rectangle(debug_frame, (x-2, y-2), (x+w+2, y+h+2), (0, 255, 0), 3)
+            cv2.putText(debug_frame, f"TARGET: {chosen.color}", 
+                       (x, y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # Verify grasp - back up and check if cube is still in view
-        self.publish_velocity(-0.05, 0.0)
-        time.sleep(1.0)
-        self.stop_robot()
-        
-        # Check if cube disappeared from camera (was picked up)
-        frame = self.detector.get_frame()
-        cubes_remaining = self.detector.detect_cubes(frame)
-        
-        # If fewer cubes visible, likely grasped successfully
-        print(f"Cubes still visible: {len(cubes_remaining)}")
-        
-        # Record as processed
-        self.cubes_processed.append({
-            'center': self.current_cube['center'],
-            'color': self.current_cube['color'],
-            'timestamp': time.time()
-        })
-        
-        print(f"Grasped {self.current_cube['color']} cube")
-        
-        # Clear flag
-        if hasattr(self, 'was_moving_for_grasp'):
-            delattr(self, 'was_moving_for_grasp')
-        
-        # Navigate to target side
-        self.transition_to(RobotState.NAVIGATING_TO_TARGET)
-    
-    # ========================================================================
-    # State: NAVIGATING TO TARGET
-    # ========================================================================
-    
-    def state_navigating_to_target(self):
-        """Navigate to the target side based on cube color"""
-        if self.current_cube is None:
-            self.transition_to(RobotState.SCANNING)
-            return
-        
-        target_direction = self._get_target_direction()
-        print(f"Navigating to {target_direction} side")
-        
-        # Simple navigation strategy:
-        # Rotate to face target direction, then drive forward
-        
-        if self.arena_boundaries is None:
-            print("No arena boundaries known, estimating...")
-            # Drive based on odometry
-            self._navigate_by_odometry(target_direction)
-        else:
-            self._navigate_by_lidar(target_direction)
-        
-        # Check if we've arrived
-        if self._check_arrival():
-            print("Arrived at target area")
-            self.transition_to(RobotState.VERIFYING_BOUNDARY)
-    
-    def _get_target_direction(self):
-        """Determine which side to go based on cube color and assignment"""
-        if self.current_cube['color'] == "RED":
-            return "RIGHT"
-        else:  # BLUE
-            return "LEFT"
-    
-    def _navigate_by_lidar(self, direction):
-        """Navigate using LiDAR wall distance"""
-        # Turn toward target wall
-        if direction == "LEFT":
-            self.publish_velocity(0.0, 1.57)  # Rotate 90° left
-            time.sleep(1.0)
-        else:  # RIGHT
-            self.publish_velocity(0.0, -1.57)  # Rotate 90° right
-            time.sleep(1.0)
-        
-        self.stop_robot()
-        
-        # Drive forward until close to wall
-        while self.min_front_distance > Config.WALL_DISTANCE_THRESHOLD:
-            self.publish_velocity(Config.LINEAR_SPEED, 0.0)
-            time.sleep(0.1)
-        
-        self.stop_robot()
-    
-    def _navigate_by_odometry(self, direction):
-        """Navigate using wheel odometry"""
-        # Simplified odometry-based navigation
-        start_position = self.pose.copy()
-        target_distance = 0.5  # Half arena width
-        
-        # Rotate to face direction
-        if direction == "LEFT":
-            self.publish_velocity(0.0, 1.57)
-            time.sleep(1.0)
-        else:
-            self.publish_velocity(0.0, -1.57)
-            time.sleep(1.0)
-        
-        self.stop_robot()
-        
-        # Drive forward
-        distance_traveled = 0.0
-        while distance_traveled < target_distance:
-            self.publish_velocity(Config.LINEAR_SPEED, 0.0)
-            time.sleep(0.1)
-            # Update distance
-            dx = self.pose['x'] - start_position['x']
-            dy = self.pose['y'] - start_position['y']
-            distance_traveled = math.sqrt(dx**2 + dy**2)
-        
-        self.stop_robot()
-    
-    def _check_arrival(self):
-        """Check if robot has reached the target zone"""
-        # Check if we're close enough to the target wall
-        if self.min_front_distance < Config.WALL_DISTANCE_THRESHOLD * 1.5:
-            return True
-        
-        # Or check odometry
-        if self.arena_boundaries:
-            # We're close to the boundary
-            return True
-        
-        return False
-    
-    # ========================================================================
-    # State: VERIFYING BOUNDARY
-    # ========================================================================
-    
-    def state_verifying_boundary(self):
-        """Verify cube placement meets the 1cm overlap requirement"""
-        print("Verifying boundary position...")
-        
-        # Strategy: Drive a bit more toward target side to ensure overlap
-        # Even if we're on the line, that's acceptable
-        
-        if self.min_front_distance > 0.05:  # At least 5cm from wall
-            # Drive a tiny bit more
-            self.publish_velocity(0.03, 0.0)
-            time.sleep(1.0)
-            self.stop_robot()
-        
-        # Consider position verified
-        print("Position verified - ready to release")
-        self.transition_to(RobotState.RELEASING)
-    
-    # ========================================================================
-    # State: RELEASING
-    # ========================================================================
-    
-    def state_releasing(self):
-        """Release the cube"""
-        if self.current_cube is None:
-            self.transition_to(RobotState.SCANNING)
-            return
-        
-        print(f"Releasing {self.current_cube['color']} cube")
-        
-        # Release servo
-        self.servo.release()
-        
-        # Back away slightly
-        self.publish_velocity(-0.05, 0.0)
-        time.sleep(2.0)
-        self.stop_robot()
-        
-        # Update counts
-        self.cubes_placed[self.current_cube['color']] += 1
-        print(f"Cubes placed - RED: {self.cubes_placed['RED']}, BLUE: {self.cubes_placed['BLUE']}")
-        
-        # Clear current cube
-        self.current_cube = None
-        
-        # Check if done
-        self.transition_to(RobotState.COUNTING)
-    
-    # ========================================================================
-    # State: COUNTING
-    # ========================================================================
-    
-    def state_counting(self):
-        """Check if all cubes have been placed"""
-        total_placed = self.cubes_placed['RED'] + self.cubes_placed['BLUE']
-        
-        print(f"Progress: {total_placed}/{self.total_cubes_to_place} cubes placed")
-        
-        if total_placed >= self.total_cubes_to_place:
-            print("\n" + "="*50)
-            print("ALL CUBES PLACED SUCCESSFULLY!")
-            print("="*50 + "\n")
-            self.transition_to(RobotState.FINISHED)
-        else:
-            print("More cubes to find...")
-            self.transition_to(RobotState.SCANNING)
-    
-    # ========================================================================
-    # State: FINISHED
-    # ========================================================================
-    
-    def state_finished(self):
-        """Mission complete"""
-        self.stop_robot()
-        self.servo.release()
-        print("Robot has completed the task!")
-        print(f"Final placement: RED={self.cubes_placed['RED']}, BLUE={self.cubes_placed['BLUE']}")
-        
-        # Optional: do a victory dance
-        for _ in range(3):
-            self.publish_velocity(0.0, 1.0)
-            time.sleep(0.5)
-            self.publish_velocity(0.0, -1.0)
-            time.sleep(0.5)
-        self.stop_robot()
-        
-        # Stop the control loop
-        self.running = False
-    
-    # ========================================================================
-    # State: ERROR
-    # ========================================================================
-    
-    def state_error(self):
-        """Error recovery state"""
-        print("ERROR STATE - Attempting recovery")
-        self.stop_robot()
-        self.servo.release()
-        
-        # Back up a bit
-        self.publish_velocity(-0.1, 0.0)
-        time.sleep(2.0)
-        self.stop_robot()
-        
-        # Reset and try scanning again
-        self.current_cube = None
-        self.transition_to(RobotState.SCANNING)
-    
-    # ========================================================================
-    # Cleanup
-    # ========================================================================
-    
-    def cleanup(self):
-        """Clean up all resources"""
-        print("Cleaning up...")
-        self.running = False
-        self.stop_robot()
-        self.detector.stop_camera()
-        self.servo.cleanup()
-        
-        if Config.SHOW_CAMERA:
-            cv2.destroyAllWindows()
-        
-        print("Cleanup complete")
+        return debug_frame
 
 
 # ============================================================================
-# Main Entry Point
+# Quick Test Script
 # ============================================================================
 
-def main():
-    """Main function"""
-    # Initialize ROS2
-    rclpy.init()
+def test_cube_detection():
+    """Standalone test to verify color detection works"""
+    print("Starting Cube Detection Test...")
+    print("Using reference-based HSV+RGB dual masking")
+    print("Press 'q' to quit, 's' to save test image\n")
     
-    try:
-        # Create robot controller
-        robot = CubeSortingRobot()
-        
-        # Run the node (this blocks until node is shut down)
-        rclpy.spin(robot)
-        
-    except KeyboardInterrupt:
-        print("\nShutdown requested by user")
+    detector = ReferenceCubeDetector()
     
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
+    # Try to open camera
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        # Try other indices
+        for i in range(1, 4):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                break
     
-    finally:
-        # Cleanup
-        try:
-            robot.cleanup()
-        except:
-            pass
+    if not cap.isOpened():
+        print("ERROR: Could not open camera!")
+        print("Trying to load test image...")
+        # Try to load a test image
+        test_img = cv2.imread("test_cubes.jpg")
+        if test_img is None:
+            print("No test image found. Please place cubes in view and run again.")
+            return
         
-        # Shutdown ROS2
-        rclpy.shutdown()
-        print("Shutdown complete")
+        # Process single image
+        chosen, red_obs, blue_obs = detector.detect(test_img)
+        debug = detector.draw_debug(test_img, chosen, red_obs, blue_obs)
+        
+        if chosen:
+            print(f"Detected: {chosen.color} cube")
+            print(f"  Score: {chosen.score:.1f}")
+            print(f"  Holes: {chosen.holes}")
+            print(f"  Distance: {chosen.distance_cm:.1f} cm")
+            print(f"  BBox: {chosen.bbox_w}x{chosen.bbox_h}")
+        else:
+            print("No cube detected in test image")
+        
+        cv2.imshow("Detection Test", debug)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        return
+    
+    print("Camera opened successfully!")
+    frame_count = 0
+    detections = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to read frame")
+            break
+        
+        frame_count += 1
+        
+        # Run detection
+        chosen, red_obs, blue_obs = detector.detect(frame)
+        
+        if chosen is not None:
+            detections += 1
+        
+        # Draw results
+        debug = detector.draw_debug(frame, chosen, red_obs, blue_obs)
+        
+        # Add stats
+        cv2.putText(debug, f"Frames: {frame_count} | Detections: {detections}", 
+                   (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        if chosen:
+            cv2.putText(debug, f"Target: {chosen.color} | Dist: {chosen.distance_cm:.1f}cm", 
+                       (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        cv2.imshow("Reference-Based Cube Detection", debug)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('s'):
+            cv2.imwrite(f"detection_test_{frame_count}.jpg", frame)
+            print(f"Saved frame {frame_count}")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    # Summary
+    if frame_count > 0:
+        print(f"\nDetection Summary:")
+        print(f"  Total frames: {frame_count}")
+        print(f"  Frames with detection: {detections}")
+        print(f"  Detection rate: {100*detections/frame_count:.1f}%")
 
+
+# Global settings matching reference
+TARGET_COLOR = "any"
+PREFER_BLUE = True
 
 if __name__ == "__main__":
-    main()
+    print("=" * 60)
+    print("Cube Detection Test - Using Reference Color Parameters")
+    print("=" * 60)
+    print(f"TARGET_COLOR: {TARGET_COLOR}")
+    print(f"PREFER_BLUE: {PREFER_BLUE}")
+    print()
+    print("This uses the EXACT HSV+RGB masking from your working code:")
+    print("  RED: HSV([0,75,40]-[16,255,255] OR [164,75,40]-[180,255,255])")
+    print("       AND RGB(r>=70, r>g+22, r>b+26)")
+    print("  BLUE: HSV([80,25,20]-[150,255,255]) OR RGB(b>=40, b>r+6, b>g-22)")
+    print("=" * 60)
+    print()
+    
+    test_cube_detection()
