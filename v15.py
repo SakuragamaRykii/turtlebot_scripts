@@ -26,13 +26,17 @@ TARGET_COLOR = "any"          # "any", "red", or "blue"
 PREFER_BLUE = True
 
 SEARCH_ANG = 0.176            # v12 1.1x speed, still slow enough to lock
-SEARCH_CENTER_BAND_PX = 95
-MIN_CENTER_FRAMES = 2
+SEARCH_CENTER_BAND_PX = 80
+MIN_CENTER_FRAMES = 3
+STARTUP_IGNORE_SEC = 0.8
+SEARCH_LOCK_MAX_JUMP_PX = 85
+SEARCH_LOCK_MIN_AREA = 180.0
+SEARCH_LOCK_MIN_BBOX_H = 14
 
 CENTER_STOP_SEC = 1.0
 BACKTRACK_AFTER_CENTER_SEC = 1.0
 BACKTRACK_AFTER_CENTER_ANG = -0.10
-FINE_ALIGN_LOST_RECOVER_SEC = 1.2
+FINE_ALIGN_LOST_RECOVER_SEC = 0.6
 FINE_ALIGN_SEARCH_ANG = 0.07
 FINE_ALIGN_PIXEL_TOL = 28
 FINE_ALIGN_HOLD_FRAMES = 2
@@ -41,11 +45,13 @@ FINE_ALIGN_MAX_ANG = 0.09
 
 APPROACH_SPEED = 0.050
 EXTRA_FORWARD_SPEED = 0.044
-EXTRA_FORWARD_AFTER_LOST_SEC = 1.5
+EXTRA_FORWARD_AFTER_LOST_SEC = 1.0
 APPROACH_LOST_GRACE_FRAMES = 6
-CAPTURE_CLOSE_DISTANCE_CM = 28.0
-CAPTURE_CLOSE_BBOX_H_PX = 96
-CAPTURE_CLOSE_BOTTOM_Y_RATIO = 0.68
+CAPTURE_CLOSE_DISTANCE_CM = 20.0
+CAPTURE_CLOSE_BBOX_H_PX = 125
+VISUAL_GRAB_DISTANCE_CM = 17.0
+VISUAL_GRAB_BBOX_H_PX = 150
+VISUAL_GRAB_BOTTOM_Y_RATIO = 0.84
 
 TURN_AFTER_GRAB_TARGET_DEG = 155.0
 TURN_RETURN_TARGET_DEG = 180.0
@@ -56,7 +62,7 @@ TURN_180_TOL_DEG = 4.0
 FORWARD_AFTER_TURN_SPEED = 0.077
 FORWARD_AFTER_TURN_SEC = 3.0
 BACKUP_SPEED = -0.26
-BACKUP_AFTER_RELEASE_SEC = 2.0
+BACKUP_AFTER_RELEASE_SEC = 1.0
 
 EMERGENCY_STOP_CM = 3.0
 EMERGENCY_STOP_M = EMERGENCY_STOP_CM / 100.0
@@ -85,6 +91,7 @@ MIN_FILL_RATIO = 0.15
 MIN_EXTENT = 0.13
 MIN_SOLIDITY = 0.40
 MIN_CENTER_Y_RATIO = 0.12
+MIN_HOLES_REQUIRED = 1
 
 REAL_CUBE_SIZE_CM = 5.0
 FOCAL_LENGTH_PX = 520.0
@@ -337,7 +344,7 @@ class CubeDetector:
                 continue
 
             holes, hole_pitch = self.detect_holes(roi_gray, shape_mask)
-            if holes < 3:
+            if holes < MIN_HOLES_REQUIRED:
                 continue
 
             center_error = abs((x + w / 2.0) - self.image_width / 2.0)
@@ -442,6 +449,9 @@ class SimpleCubeMissionV15(Node):
         self.approach_lost_frames = 0
         self.last_seen_target = None
         self.completed_cycles = 0
+        self.lock_color = None
+        self.lock_cx = None
+        self.lock_frames = 0
 
         self.state = "WAIT_FOR_DATA"
         self.state_enter_time = time.monotonic()
@@ -455,7 +465,7 @@ class SimpleCubeMissionV15(Node):
         print("[BOOT] SimpleCubeMission v15")
         print("[MODE] compressed image only, no imports from old versions")
         print("[FLOW] search -> stop 1s -> backtrack turn 1s -> fine align -> approach")
-        print("[FLOW] only close target loss triggers forward 1.5s and servo down")
+        print("[FLOW] only close target loss triggers forward 1.0s and servo down")
         print(f"[TARGET] TARGET_COLOR={TARGET_COLOR} PREFER_BLUE={PREFER_BLUE}")
         print(f"[SERVO] UP={SERVO_UP_DUTY} DOWN={SERVO_DOWN_DUTY} BCM={SERVO_GPIO_BCM}")
         print("[CMD] type H then Enter to stop and exit")
@@ -507,6 +517,9 @@ class SimpleCubeMissionV15(Node):
             self.grab_color = None
             self.approach_lost_frames = 0
             self.last_seen_target = None
+            self.lock_color = None
+            self.lock_cx = None
+            self.lock_frames = 0
         if new_state in ("CENTER_STOP", "BACKTRACK_AFTER_CENTER", "FINE_ALIGN"):
             self.center_seen_frames = 0
         if new_state == "APPROACH":
@@ -605,6 +618,40 @@ class SimpleCubeMissionV15(Node):
         err = self.target_error_pixels()
         return err is not None and abs(err) <= SEARCH_CENTER_BAND_PX
 
+    def target_good_enough_to_lock(self, obs):
+        if obs is None:
+            return False
+        if obs.area < SEARCH_LOCK_MIN_AREA or obs.bbox_h < SEARCH_LOCK_MIN_BBOX_H:
+            return False
+        if obs.holes <= 0 and (obs.area < 450.0 or obs.bbox_h < 24):
+            return False
+        return True
+
+    def update_search_lock(self):
+        if not self.target_visible or self.target_obs is None:
+            self.lock_color = None
+            self.lock_cx = None
+            self.lock_frames = 0
+            return 0
+        if not self.target_centered() or not self.target_good_enough_to_lock(self.target_obs):
+            self.lock_color = None
+            self.lock_cx = None
+            self.lock_frames = 0
+            return 0
+
+        if (
+            self.lock_color == self.target_obs.color
+            and self.lock_cx is not None
+            and abs(self.target_obs.cx - self.lock_cx) <= SEARCH_LOCK_MAX_JUMP_PX
+        ):
+            self.lock_frames += 1
+            self.lock_cx = 0.65 * self.lock_cx + 0.35 * self.target_obs.cx
+        else:
+            self.lock_color = self.target_obs.color
+            self.lock_cx = self.target_obs.cx
+            self.lock_frames = 1
+        return self.lock_frames
+
     def remember_target_for_capture(self):
         if not self.target_visible or self.target_obs is None:
             return
@@ -621,10 +668,19 @@ class SimpleCubeMissionV15(Node):
             return False
         distance_cm = self.last_seen_target["distance_cm"]
         bbox_h = self.last_seen_target["bbox_h"]
-        bottom_y = self.last_seen_target["bottom_y"]
         close_by_distance = 0.1 < distance_cm <= CAPTURE_CLOSE_DISTANCE_CM
         close_by_size = bbox_h >= CAPTURE_CLOSE_BBOX_H_PX
-        close_by_bottom = bottom_y >= self.image_height * CAPTURE_CLOSE_BOTTOM_Y_RATIO
+        return close_by_distance or close_by_size
+
+    def current_target_is_grab_ready(self):
+        if not self.target_visible or self.target_obs is None or self.image_height is None:
+            return False
+        distance_cm = self.target_obs.distance_cm
+        bbox_h = self.target_obs.bbox_h
+        bottom_y = self.target_obs.bbox_y + self.target_obs.bbox_h
+        close_by_distance = 0.1 < distance_cm <= VISUAL_GRAB_DISTANCE_CM
+        close_by_size = bbox_h >= VISUAL_GRAB_BBOX_H_PX
+        close_by_bottom = bottom_y >= self.image_height * VISUAL_GRAB_BOTTOM_Y_RATIO and bbox_h >= 90
         return close_by_distance or close_by_size or close_by_bottom
 
     def last_target_summary(self):
@@ -642,16 +698,21 @@ class SimpleCubeMissionV15(Node):
             self.set_state("STOPPED", "emergency front distance")
             return
 
-        if self.target_visible and self.target_obs is not None:
-            if self.target_centered():
-                self.center_seen_frames += 1
+        if self.state_age() >= STARTUP_IGNORE_SEC:
+            lock_frames = self.update_search_lock()
+            if lock_frames >= MIN_CENTER_FRAMES:
+                self.grab_color = self.target_obs.color
+                self.remember_target_for_capture()
                 self.stop_robot_once()
-                if self.center_seen_frames >= MIN_CENTER_FRAMES:
-                    self.grab_color = self.target_obs.color
-                    self.remember_target_for_capture()
-                    self.set_state("CENTER_STOP", f"{self.grab_color} centered, stop before correction")
+                self.set_state("CENTER_STOP", f"{self.grab_color} stable centered, stop before correction")
                 return
-            self.center_seen_frames = 0
+            if lock_frames > 0:
+                self.publish_cmd(0.0, SEARCH_ANG * 0.35)
+                return
+        else:
+            self.lock_color = None
+            self.lock_cx = None
+            self.lock_frames = 0
 
         self.publish_cmd(0.0, SEARCH_ANG)
 
@@ -717,6 +778,10 @@ class SimpleCubeMissionV15(Node):
 
         self.approach_lost_frames = 0
         self.remember_target_for_capture()
+        if self.current_target_is_grab_ready():
+            self.stop_robot_once()
+            self.set_state("SERVO_DOWN", f"target visually close, {self.last_target_summary()}")
+            return
         self.publish_cmd(APPROACH_SPEED, 0.0)
 
     def handle_extra_forward_after_lost(self):
@@ -752,7 +817,7 @@ class SimpleCubeMissionV15(Node):
     def handle_servo_up_release(self):
         self.stop_robot_reliable(repeat=5, delay=0.02)
         self.servo.servo_up()
-        self.set_state("BACKUP_AFTER_RELEASE", "backup 2s")
+        self.set_state("BACKUP_AFTER_RELEASE", "backup 1s")
 
     def handle_backup_after_release(self):
         if self.state_age() < BACKUP_AFTER_RELEASE_SEC:
