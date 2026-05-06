@@ -13,6 +13,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, LaserScan
 
+import v11 as v11_base
 from v11 import (
     APPROACH_SPEED,
     BACKUP_AFTER_RELEASE_SEC,
@@ -36,6 +37,30 @@ from v11 import (
     TURN_RETURN_MAX_ANG,
     ServoHelper,
 )
+
+
+# =========================
+# v12 field tuning overrides
+# =========================
+# 全局速度提高 10%。第一次抓取后的转身单独提高到 1.2 倍，但目标角度
+# 略小一点，用来抵消实车惯性导致的 210-225 度超转。
+SPEED_SCALE_ALL = 1.10
+TURN_AFTER_GRAB_SPEED_SCALE = 1.20
+TURN_AFTER_GRAB_TARGET_DEG = 155.0
+TURN_RETURN_TARGET_DEG = 180.0
+
+SEARCH_ANG *= SPEED_SCALE_ALL
+APPROACH_SPEED *= SPEED_SCALE_ALL
+EXTRA_FORWARD_SPEED *= SPEED_SCALE_ALL
+FORWARD_AFTER_TURN_SPEED *= SPEED_SCALE_ALL
+BACKUP_SPEED *= SPEED_SCALE_ALL
+TURN_RETURN_MAX_ANG *= SPEED_SCALE_ALL
+TURN_AFTER_GRAB_MAX_ANG *= TURN_AFTER_GRAB_SPEED_SCALE
+
+# 放下不够多：v11 的 ServoHelper 使用 v11 模块自己的全局常量，
+# 所以这里同时改 v11_base，确保 servo_down() 真正用新值。
+SERVO_DOWN_DUTY = 4.2
+v11_base.SERVO_DOWN_DUTY = SERVO_DOWN_DUTY
 
 
 class SimpleCubeMissionV12(Node):
@@ -91,6 +116,7 @@ class SimpleCubeMissionV12(Node):
         print("[BOOT] SimpleCubeMission v12")
         print("[FIX] compressed image only, same camera path as v5/v7")
         print("[MODE] center-band lock -> straight approach -> target lost => forward 1.5s -> servo sequence")
+        print(f"[TUNE] speed_scale={SPEED_SCALE_ALL:.2f} first_turn_target={TURN_AFTER_GRAB_TARGET_DEG:.0f}deg first_turn_speed_scale={TURN_AFTER_GRAB_SPEED_SCALE:.2f}")
         print(f"[SERVO] UP={SERVO_UP_DUTY} DOWN={SERVO_DOWN_DUTY} BCM={SERVO_GPIO_BCM}")
         print("[CMD] type H then Enter to stop and exit")
 
@@ -265,7 +291,7 @@ class SimpleCubeMissionV12(Node):
     def handle_servo_down(self):
         self.stop_robot_reliable(repeat=5, delay=0.02)
         self.servo.servo_down()
-        self.start_turn_relative(math.pi, "TURN_180_AFTER_GRAB")
+        self.start_turn_relative(math.radians(TURN_AFTER_GRAB_TARGET_DEG), "TURN_180_AFTER_GRAB")
 
     def handle_turn_180_after_grab(self):
         error = self.normalize_angle(self.turn_target_yaw - self.local_yaw)
@@ -293,7 +319,7 @@ class SimpleCubeMissionV12(Node):
             self.publish_cmd(BACKUP_SPEED, 0.0)
             return
         self.stop_robot_once()
-        self.start_turn_relative(math.pi, "TURN_180_RETURN")
+        self.start_turn_relative(math.radians(TURN_RETURN_TARGET_DEG), "TURN_180_RETURN")
 
     def handle_turn_180_return(self):
         error = self.normalize_angle(self.turn_target_yaw - self.local_yaw)
