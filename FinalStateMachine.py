@@ -785,6 +785,11 @@ class SimpleCubeMissionV42(Node):
             # NEW: Record position where cube was grabbed
             self.grab_position_x = self.position_tracker.x
             print(f"[POS] Cube grabbed at x={self.grab_position_x:.2f}m")
+        if new_state == "PREDELIVERY_BACKUP":
+            self.target_visible = False
+            self.target_obs = None
+            self.red_obs = None
+            self.blue_obs = None
         if new_state == "DRIVE_TO_DELIVERY_ZONE":
             self.delivery_marker_lost_frames = 0
             self.delivery_marker_seen_once = False
@@ -1169,11 +1174,20 @@ class SimpleCubeMissionV42(Node):
         self.delivery_marker_ids = self.delivery_ids_for_color(self.grab_color)
         
         # NEW: Decide delivery method based on mode
+    def handle_servo_down(self):
+        self.stop_robot_reliable(repeat=5, delay=0.02)
+        self.servo.servo_down()
+        time.sleep(0.12)
+        self.servo.servo_down()
+        self.delivery_marker_ids = self.delivery_ids_for_color(self.grab_color)
+        
+        # NEW: Decide delivery method based on mode
         if POSITION_BASED_DELIVERY:
-            # Use position-based backward delivery
+            # Pre-delivery maneuver: backup briefly, then slight rotation to avoid cube collisions
             print(f"[DELIVERY] Position-based delivery for {self.grab_color} cube")
             print(f"[DELIVERY] Current x: {self.position_tracker.x:.2f}m")
-            self.set_state("BACKWARD_DELIVERY", f"backing into {self.position_tracker.get_zone_for_cube(self.grab_color or 'red')}")
+            print(f"[PREDELIVERY] Starting pre-delivery maneuver (backup + slight rotation)")
+            self.set_state("PREDELIVERY_BACKUP", "brief backup to seat cube in grabber")
         else:
             # Original marker-based delivery
             self.set_state("BACKUP_AFTER_GRAB", f"backup 0.7s before turn, marker ids={sorted(self.delivery_marker_ids)}")
@@ -1403,7 +1417,9 @@ class SimpleCubeMissionV42(Node):
             "APPROACH": self.handle_approach,
             "EXTRA_FORWARD_AFTER_LOST": self.handle_extra_forward_after_lost,
             "SERVO_DOWN": self.handle_servo_down,
-            "BACKWARD_DELIVERY": self.handle_backward_delivery,  # NEW
+            "PREDELIVERY_BACKUP": self.handle_predelivery_backup,    # NEW
+            "PREDELIVERY_ROTATE": self.handle_predelivery_rotate,    # NEW
+            "BACKWARD_DELIVERY": self.handle_backward_delivery,
             "BACKUP_AFTER_GRAB": self.handle_backup_after_grab,
             "TURN_TO_DELIVERY_MARKER": self.handle_turn_to_delivery_marker,
             "DRIVE_TO_DELIVERY_ZONE": self.handle_drive_to_delivery_zone,
