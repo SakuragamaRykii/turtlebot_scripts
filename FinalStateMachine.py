@@ -147,6 +147,11 @@ POSITION_HISTORY_SEC = 2.0
 MAX_CUBES = 4
 
 
+# NEW: Pre-delivery rotation to avoid cube collisions
+PREDELIVERY_ROTATE_ANG = 0.176       # Rotation speed for pre-delivery turn
+PREDELIVERY_ROTATE_SEC = 0.5         # Duration of slight rotation (anti-clockwise)
+PREDELIVERY_ROTATE_DIRECTION = 1.0   # 1.0 = anti-clockwise, -1.0 = clockwise
+
 @dataclass
 class CubeObservation:
     color: str
@@ -785,11 +790,6 @@ class SimpleCubeMissionV42(Node):
             # NEW: Record position where cube was grabbed
             self.grab_position_x = self.position_tracker.x
             print(f"[POS] Cube grabbed at x={self.grab_position_x:.2f}m")
-        if new_state == "PREDELIVERY_BACKUP":
-            self.target_visible = False
-            self.target_obs = None
-            self.red_obs = None
-            self.blue_obs = None
         if new_state == "DRIVE_TO_DELIVERY_ZONE":
             self.delivery_marker_lost_frames = 0
             self.delivery_marker_seen_once = False
@@ -1173,24 +1173,12 @@ class SimpleCubeMissionV42(Node):
         self.servo.servo_down()
         self.delivery_marker_ids = self.delivery_ids_for_color(self.grab_color)
         
-        # NEW: Decide delivery method based on mode
-    def handle_servo_down(self):
-        self.stop_robot_reliable(repeat=5, delay=0.02)
-        self.servo.servo_down()
-        time.sleep(0.12)
-        self.servo.servo_down()
-        self.delivery_marker_ids = self.delivery_ids_for_color(self.grab_color)
+        # Record position where cube was grabbed
+        self.grab_position_x = self.position_tracker.x
+        print(f"[POS] Cube grabbed at x={self.grab_position_x:.2f}m")
         
-        # NEW: Decide delivery method based on mode
-        if POSITION_BASED_DELIVERY:
-            # Pre-delivery maneuver: backup briefly, then slight rotation to avoid cube collisions
-            print(f"[DELIVERY] Position-based delivery for {self.grab_color} cube")
-            print(f"[DELIVERY] Current x: {self.position_tracker.x:.2f}m")
-            print(f"[PREDELIVERY] Starting pre-delivery maneuver (backup + slight rotation)")
-            self.set_state("PREDELIVERY_BACKUP", "brief backup to seat cube in grabber")
-        else:
-            # Original marker-based delivery
-            self.set_state("BACKUP_AFTER_GRAB", f"backup 0.7s before turn, marker ids={sorted(self.delivery_marker_ids)}")
+        # Always go through BACKUP_AFTER_GRAB (which now includes rotation)
+        self.set_state("BACKUP_AFTER_GRAB", f"backup {BACKUP_AFTER_GRAB_SEC}s + rotate {PREDELIVERY_ROTATE_SEC}s")
 
     # ========================================================================
     # NEW: Position-based backward delivery
@@ -1243,11 +1231,32 @@ class SimpleCubeMissionV42(Node):
         self.publish_cmd(speed, steer)
 
     def handle_backup_after_grab(self):
+        """Backup briefly then rotate slightly to offset return trajectory"""
+        total_time = BACKUP_AFTER_GRAB_SEC + PREDELIVERY_ROTATE_SEC
+        
         if self.state_age() < BACKUP_AFTER_GRAB_SEC:
+            # Phase 1: Brief backup to seat cube in grabber
             self.publish_cmd(BACKUP_AFTER_GRAB_SPEED, 0.0)
             return
+        
+        if self.state_age() < total_time:
+            # Phase 2: Slight rotation to avoid cube collisions on return
+            if self.state_age() < BACKUP_AFTER_GRAB_SEC + 0.1:  # Small transition window
+                print(f"[PREDELIVERY] Backup complete, rotating to offset trajectory")
+            self.publish_cmd(0.0, PREDELIVERY_ROTATE_DIRECTION * PREDELIVERY_ROTATE_ANG)
+            return
+        
+        # Both phases complete - stop and proceed
         self.stop_robot_once()
-        self.set_state("TURN_TO_DELIVERY_MARKER", f"find marker ids={sorted(self.delivery_marker_ids)}")
+        print(f"[PREDELIVERY] Maneuver complete: backup {BACKUP_AFTER_GRAB_SEC}s + rotate {PREDELIVERY_ROTATE_SEC}s")
+        print(f"[PREDELIVERY] Position: x={self.position_tracker.x:.2f}m, y={self.position_tracker.y:.2f}m")
+        
+        # Now decide: position-based delivery or marker-based delivery
+        if POSITION_BASED_DELIVERY:
+            target_zone = self.position_tracker.get_zone_for_cube(self.grab_color or "red")
+            self.set_state("BACKWARD_DELIVERY", f"backing into {target_zone}")
+        else:
+            self.set_state("TURN_TO_DELIVERY_MARKER", f"find marker ids={sorted(self.delivery_marker_ids)}")
 
     def handle_turn_to_delivery_marker(self):
         if self.state_age() > MARKER_TURN_TIMEOUT_SEC:
@@ -1417,9 +1426,7 @@ class SimpleCubeMissionV42(Node):
             "APPROACH": self.handle_approach,
             "EXTRA_FORWARD_AFTER_LOST": self.handle_extra_forward_after_lost,
             "SERVO_DOWN": self.handle_servo_down,
-            "PREDELIVERY_BACKUP": self.handle_predelivery_backup,    # NEW
-            "PREDELIVERY_ROTATE": self.handle_predelivery_rotate,    # NEW
-            "BACKWARD_DELIVERY": self.handle_backward_delivery,
+            "BACKWARD_DELIVERY": self.handle_backward_delivery,  # NEW
             "BACKUP_AFTER_GRAB": self.handle_backup_after_grab,
             "TURN_TO_DELIVERY_MARKER": self.handle_turn_to_delivery_marker,
             "DRIVE_TO_DELIVERY_ZONE": self.handle_drive_to_delivery_zone,
