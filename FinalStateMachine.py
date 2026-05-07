@@ -22,39 +22,33 @@ except Exception:
 # =========================
 # Mission tuning
 # =========================
-DEFAULT_TARGET_COLOR = "red"
+DEFAULT_TARGET_COLOR = "red"   # used before a zone marker has been seen
 PREFER_BLUE = False
 
-# UPDATED: Centering parameters
+# v42: exam-room mode. Faster lock, no one-second reverse correction.
 SEARCH_ANG = 0.176
 SEARCH_CENTER_BAND_PX = 95
-MIN_CENTER_FRAMES = 2
+MIN_CENTER_FRAMES = 1
 
-# REMOVED: CENTER_STOP_SEC, BACKTRACK_AFTER_CENTER_SEC, BACKTRACK_AFTER_CENTER_ANG
-# NEW: Active centering parameters
-ACTIVE_CENTER_MIN_DURATION = 0.5     # Must be centered for this long
-ACTIVE_CENTER_PIXEL_TOL = 25         # Tight tolerance for "centered"
-ACTIVE_CENTER_MIN_ANG = 0.02         # Minimum rotation speed
-ACTIVE_CENTER_MAX_ANG = 0.12         # Maximum rotation speed
-ACTIVE_CENTER_GAIN = 0.22            # Proportional gain for centering
-ACTIVE_CENTER_DECEL_ZONE = 0.3       # Normalized error threshold for deceleration
-ACTIVE_CENTER_TIMEOUT = 8.0          # Maximum time in centering phase
-ACTIVE_CENTER_LOST_RECOVER = 1.5     # Recovery search time if target lost
-ACTIVE_CENTER_RECOVER_ANG = 0.06     # Recovery search speed
+CENTER_STOP_SEC = 0.12
+BACKTRACK_AFTER_CENTER_SEC = 0.0
+BACKTRACK_AFTER_CENTER_ANG = 0.0
+FINE_ALIGN_LOST_RECOVER_SEC = 0.7
+FINE_ALIGN_SEARCH_ANG = 0.07
+FINE_ALIGN_PIXEL_TOL = 34
+FINE_ALIGN_HOLD_FRAMES = 1
+FINE_ALIGN_MIN_ANG = 0.025
+FINE_ALIGN_MAX_ANG = 0.09
 
-# NEW: Adaptive approach parameters
-APPROACH_SPEED = 0.065
-APPROACH_MAX_SPEED = 0.08
-APPROACH_MIN_SPEED = 0.03
-APPROACH_STEER_GAIN = 0.15           # How aggressively to correct heading
-APPROACH_STEER_MAX = 0.12            # Maximum steering during approach
-APPROACH_CENTER_TOLERANCE = 40       # Pixels - wider than fine align for stability
-APPROACH_CENTER_HOLD = 3             # Frames to confirm re-centered
-APPROACH_RECENTER_SPEED = 0.04       # Slower speed while re-centering
+APPROACH_SPEED = 0.078
+APPROACH_STEER_GAIN = 0.0022
+APPROACH_STEER_MAX = 0.13
+EXTRA_FORWARD_SPEED = 0.060
+EXTRA_FORWARD_AFTER_LOST_SEC = 1.2
+BACKUP_AFTER_GRAB_SPEED = -0.12
+BACKUP_AFTER_GRAB_SEC = 0.7
 APPROACH_LOST_GRACE_FRAMES = 5
 BLUE_APPROACH_LOST_GRACE_FRAMES = 14
-EXTRA_FORWARD_SPEED = 0.055
-EXTRA_FORWARD_AFTER_LOST_SEC = 1.5
 
 LOST_CAPTURE_CLOSE_DISTANCE_CM = 24.0
 LOST_CAPTURE_CLOSE_BBOX_H_PX = 105
@@ -63,22 +57,23 @@ MARKER_ALIGN_PIXEL_TOL = 24.0
 MARKER_ALIGN_HOLD_FRAMES = 2
 MARKER_TURN_SPEED = 0.220
 MARKER_TURN_TIMEOUT_SEC = 35.0
+MARKER_TIMEOUT_STOP = True
+ZONE_MARKER_STABLE_FRAMES = 3
 
-DELIVERY_FORWARD_SPEED = 0.116
-DELIVERY_FORWARD_SEC = 5.0
+# Position-based delivery settings
+RETURN_TO_ZONE_SPEED = 0.14
+RETURN_TO_ZONE_POSITION_TOLERANCE = 0.10  # meters
+RETURN_TO_ZONE_TIMEOUT_SEC = 20.0
+
 BACKUP_SPEED = -0.26
-BACKUP_AFTER_RELEASE_SEC = 2.0
+BACKUP_AFTER_RELEASE_SEC = 1.0
+TURN_AFTER_RELEASE_DEG = -90.0
+TURN_AFTER_RELEASE_TOL_DEG = 5.0
+TURN_AFTER_RELEASE_SPEED = 0.20
+RETURN_CENTER_AFTER_RELEASE = False  # Disabled since we use position-based return
 
 EMERGENCY_STOP_CM = 3.0
 EMERGENCY_STOP_M = EMERGENCY_STOP_CM / 100.0
-
-# Navigation tuning
-NAVIGATE_TO_ZONE_SPEED = 0.08
-NAVIGATE_TO_ZONE_ANG = 0.15
-NAVIGATE_TARGET_DISTANCE_M = 0.3
-ZONE_BOUNDARY_X = 0.0
-POSITION_HISTORY_SEC = 2.0
-MAX_CUBES = 4
 
 
 # =========================
@@ -99,28 +94,33 @@ MIN_CONTOUR_AREA = 120.0
 MIN_BBOX_W = 10
 MIN_BBOX_H = 10
 MIN_ASPECT = 0.55
-MAX_ASPECT = 1.75
+MAX_ASPECT = 2.05
 MIN_FILL_RATIO = 0.15
 MIN_EXTENT = 0.13
 MIN_SOLIDITY = 0.40
 MIN_CENTER_Y_RATIO = 0.12
 
 RED_MIN_HOLES_REQUIRED = 3
-BLUE_MIN_HOLES_REQUIRED = 1
+BLUE_MIN_HOLES_REQUIRED = 0
 
 RED_ZONE_MARKER_IDS = {0}
 BLUE_ZONE_MARKER_IDS = {23}
-RED_ZONE_EDGE_IDS = {7}
-BLUE_ZONE_EDGE_IDS = {42}
+NORTH_LINE_MARKER_IDS = {7}
+SOUTH_LINE_MARKER_IDS = {42}
 
-SEARCH_START_DIRECTION = 1.0
+SEARCH_START_DIRECTION = 1.0      # positive angular.z, startup counterclockwise
 SEARCH_AFTER_RELEASE_DIRECTION = -1.0
+ZONE_UPDATE_STATES = {
+    "WAIT_FOR_DATA",
+    "SEARCH",
+}
 
 REAL_CUBE_SIZE_CM = 5.0
 FOCAL_LENGTH_PX = 520.0
 
 CONTROL_DT = 0.05
 STATUS_DT = 0.8
+CAMERA_GAMMA = 1.5
 
 
 @dataclass
@@ -153,85 +153,13 @@ class MarkerObservation:
 
 
 @dataclass
-class RobotPosition:
-    """Tracks robot position with timestamp for history"""
+class Position:
     x: float
     y: float
-    yaw: float
-    timestamp: float
-
-
-class PositionTracker:
-    """Tracks robot position using odometry integration"""
-    def __init__(self):
-        self.x = 0.0
-        self.y = 0.0
-        self.yaw = 0.0
-        self.last_odom_time = None
-        self.last_linear_x = 0.0
-        self.last_angular_z = 0.0
-        self.position_history = []
-        
-    def update_from_velocity(self, linear_x: float, angular_z: float, current_time: float):
-        if self.last_odom_time is None:
-            self.last_odom_time = current_time
-            return
-            
-        dt = current_time - self.last_odom_time
-        if dt <= 0:
-            return
-            
-        if abs(angular_z) < 1e-6:
-            self.x += linear_x * math.cos(self.yaw) * dt
-            self.y += linear_x * math.sin(self.yaw) * dt
-        else:
-            radius = linear_x / angular_z
-            d_theta = angular_z * dt
-            self.x += radius * (math.sin(self.yaw + d_theta) - math.sin(self.yaw))
-            self.y -= radius * (math.cos(self.yaw + d_theta) - math.cos(self.yaw))
-            self.yaw += d_theta
-            
-        self.yaw = self.normalize_angle(self.yaw)
-        self.last_odom_time = current_time
-        
-        self.position_history.append(RobotPosition(
-            x=self.x, y=self.y, yaw=self.yaw, timestamp=current_time
-        ))
-        
-        cutoff = current_time - POSITION_HISTORY_SEC
-        self.position_history = [p for p in self.position_history if p.timestamp > cutoff]
     
-    def update_from_odometry(self, x: float, y: float, yaw: float, current_time: float):
-        self.x = x
-        self.y = y
-        self.yaw = yaw
-        self.last_odom_time = current_time
-        
-        self.position_history.append(RobotPosition(
-            x=self.x, y=self.y, yaw=self.yaw, timestamp=current_time
-        ))
-        
-        cutoff = current_time - POSITION_HISTORY_SEC
-        self.position_history = [p for p in self.position_history if p.timestamp > cutoff]
-    
-    def get_zone(self) -> str:
-        if self.x > ZONE_BOUNDARY_X:
-            return "RED_ZONE"
-        elif self.x < -ZONE_BOUNDARY_X:
-            return "BLUE_ZONE"
-        return "BOUNDARY"
-    
-    def normalize_angle(self, angle: float) -> float:
-        return math.atan2(math.sin(angle), math.cos(angle))
-    
-    def get_distance_to(self, target_x: float, target_y: float) -> float:
-        return math.sqrt((self.x - target_x)**2 + (self.y - target_y)**2)
-    
-    def get_angle_to(self, target_x: float, target_y: float) -> float:
-        dx = target_x - self.x
-        dy = target_y - self.y
-        target_angle = math.atan2(dy, dx)
-        return self.normalize_angle(target_angle - self.yaw)
+    def distance_to(self, other):
+        """Calculate Euclidean distance to another position"""
+        return math.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
 
 
 class ServoHelper:
@@ -284,9 +212,9 @@ class CubeDetector:
         self.focal_length_px = FOCAL_LENGTH_PX
 
     def build_red_mask(self, hsv, bgr):
-        lower_red_1 = np.array([0, 75, 40], dtype=np.uint8)
-        upper_red_1 = np.array([16, 255, 255], dtype=np.uint8)
-        lower_red_2 = np.array([164, 75, 40], dtype=np.uint8)
+        lower_red_1 = np.array([0, 115, 50], dtype=np.uint8)
+        upper_red_1 = np.array([10, 255, 255], dtype=np.uint8)
+        lower_red_2 = np.array([170, 115, 50], dtype=np.uint8)
         upper_red_2 = np.array([180, 255, 255], dtype=np.uint8)
         hsv_mask = cv2.bitwise_or(
             cv2.inRange(hsv, lower_red_1, upper_red_1),
@@ -297,20 +225,20 @@ class CubeDetector:
         g = bgr[:, :, 1].astype(np.int16)
         r = bgr[:, :, 2].astype(np.int16)
         rgb_mask = np.zeros_like(hsv_mask)
-        rgb_mask[(r >= 70) & (r > g + 22) & (r > b + 26)] = 255
+        rgb_mask[(r >= 65) & (r > g + 18) & (r > b + 22)] = 255
         return cv2.bitwise_and(hsv_mask, rgb_mask)
 
     def build_blue_mask(self, hsv, bgr):
-        lower_blue = np.array([80, 25, 20], dtype=np.uint8)
-        upper_blue = np.array([150, 255, 255], dtype=np.uint8)
+        lower_blue = np.array([102, 125, 45], dtype=np.uint8)
+        upper_blue = np.array([132, 255, 255], dtype=np.uint8)
         hsv_mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
         b = bgr[:, :, 0].astype(np.int16)
         g = bgr[:, :, 1].astype(np.int16)
         r = bgr[:, :, 2].astype(np.int16)
         rgb_mask = np.zeros_like(hsv_mask)
-        rgb_mask[(b >= 40) & (b > r + 6) & (b > g - 22)] = 255
-        return cv2.bitwise_or(hsv_mask, rgb_mask)
+        rgb_mask[(b >= 45) & (b > r + 12) & (b > g - 6)] = 255
+        return cv2.bitwise_and(hsv_mask, rgb_mask)
 
     def preprocess_mask(self, mask):
         mask = cv2.medianBlur(mask, 5)
@@ -380,24 +308,24 @@ class CubeDetector:
         sat = hsv_pixels[:, 1]
 
         if color == "blue":
-            hue_ratio = float(np.mean((hue >= 80) & (hue <= 150) & (sat >= 25)))
+            hue_ratio = float(np.mean((hue >= 102) & (hue <= 132) & (sat >= 115)))
             dom_br = float(mean_b - mean_r)
             dom_bg = float(mean_b - mean_g)
             conf = 0.25 * mean_s + 0.35 * dom_br + 0.15 * dom_bg + 90.0 * hue_ratio
-            ok = hue_ratio >= 0.18 and mean_v >= 30 and mean_b >= 40 and dom_br >= 5
+            ok = hue_ratio >= 0.16 and mean_s >= 105 and mean_v >= 40 and mean_b >= 45 and dom_br >= 10
             return ok, float(conf)
 
-        hue_ratio = float(np.mean(((hue <= 16) | (hue >= 164)) & (sat >= 65)))
+        hue_ratio = float(np.mean(((hue <= 10) | (hue >= 170)) & (sat >= 105)))
         dom_rb = float(mean_r - mean_b)
         dom_rg = float(mean_r - mean_g)
         conf = 0.25 * mean_s + 0.35 * dom_rb + 0.25 * dom_rg + 90.0 * hue_ratio
         ok = (
-            hue_ratio >= 0.25
-            and mean_s >= 65
+            hue_ratio >= 0.18
+            and mean_s >= 105
             and mean_v >= 40
             and mean_r >= 65
-            and dom_rb >= 20
-            and dom_rg >= 16
+            and dom_rb >= 18
+            and dom_rg >= 14
         )
         return ok, float(conf)
 
@@ -576,9 +504,9 @@ class MarkerDetector:
         )
 
 
-class SimpleCubeMissionV30(Node):
+class SimpleCubeMissionV42(Node):
     def __init__(self):
-        super().__init__("simple_cube_mission_v30")
+        super().__init__("simple_cube_mission_v42")
 
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.scan_sub = self.create_subscription(LaserScan, "/scan", self.scan_callback, qos_profile_sensor_data)
@@ -596,11 +524,6 @@ class SimpleCubeMissionV30(Node):
         self.detector = CubeDetector()
         self.marker_detector = MarkerDetector()
         self.servo = ServoHelper()
-        
-        # Position tracking
-        self.position_tracker = PositionTracker()
-        self.last_cmd_linear = 0.0
-        self.last_cmd_angular = 0.0
 
         self.has_scan = False
         self.has_odom = False
@@ -610,10 +533,18 @@ class SimpleCubeMissionV30(Node):
         self.image_height = None
         self.image_logged = False
 
+        # Odometry tracking
+        self.current_position = Position(0.0, 0.0)
         self.world_yaw = 0.0
         self.init_yaw = None
         self.local_yaw = 0.0
         self.turn_target_yaw = 0.0
+
+        # Zone position tracking
+        self.red_zone_position = None
+        self.blue_zone_position = None
+        self.pickup_position = None  # Position where cube was grabbed
+        self.target_zone_position = None  # Where to deliver current cube
 
         self.target_visible = False
         self.target_obs = None
@@ -623,31 +554,22 @@ class SimpleCubeMissionV30(Node):
         self.marker_visible = False
         self.current_zone = "UNKNOWN"
         self.current_target_color = DEFAULT_TARGET_COLOR
+        self.locked_search_color = None
+        self.zone_candidate = "UNKNOWN"
+        self.zone_candidate_frames = 0
+        self.last_marker_id = None
+        self.last_zone_reason = "none"
         self.delivery_marker_ids = set()
+        self.delivery_marker_lost_frames = 0
+        self.delivery_marker_seen_once = False
         self.marker_align_frames = 0
         self.center_seen_frames = 0
-        
-        # NEW: Active centering timing
-        self.centered_start_time = None    # When we first achieved center
-        self.centered_ready = False        # True once held for required duration
-        
-        # NEW: Approach adjust tracking
         self.approach_lost_frames = 0
-        self.approach_recenter_frames = 0  # Frames cube has been re-centered
-        self.approach_is_recentering = False  # Whether we're in re-center mode
-        
         self.grab_color = None
         self.last_seen_target = None
         self.completed_cycles = 0
         self.detect_error_count = 0
         self.search_direction = SEARCH_START_DIRECTION
-        
-        # Mission tracking
-        self.moved_cubes = 0
-        self.navigate_target_x = None
-        self.navigate_target_y = None
-        self.navigate_target_yaw = None
-        self.navigate_start_time = 0.0
 
         self.state = "WAIT_FOR_DATA"
         self.state_enter_time = time.monotonic()
@@ -658,13 +580,19 @@ class SimpleCubeMissionV30(Node):
         self.console_thread = threading.Thread(target=self.console_loop, daemon=True)
         self.console_thread.start()
 
-        print("[BOOT] SimpleCubeMission v30 - Adaptive Centering")
+        print("[BOOT] SimpleCubeMission v42 - Position-Based Delivery")
         print("[MODE] full standalone, compressed camera only")
-        print("[FEATURE] Active centering with minimum hold duration")
-        print("[FEATURE] Adaptive approach with re-centering capability")
-        print(f"[MARKER] RED_ZONE={sorted(RED_ZONE_MARKER_IDS)} BLUE_ZONE={sorted(BLUE_ZONE_MARKER_IDS)}")
+        print("[FLOW] fast lock: search -> short stop -> fine align -> approach with steering -> lost -> forward 1.2s -> arm down")
+        print("[FLOW] after arm down: position-based backward delivery to recorded zone")
+        print("[FLOW] after release: backup 1s -> search")
+        print("[VISION] gamma corrected, Group9-style HSV red/blue masks")
+        print(
+            f"[MARKER] RED_ZONE={sorted(RED_ZONE_MARKER_IDS)} BLUE_ZONE={sorted(BLUE_ZONE_MARKER_IDS)} "
+            f"NORTH_LINE={sorted(NORTH_LINE_MARKER_IDS)} SOUTH_LINE={sorted(SOUTH_LINE_MARKER_IDS)}"
+        )
         print(f"[TARGET] default={DEFAULT_TARGET_COLOR}, blue-zone=>red cube, red-zone=>blue cube")
         print(f"[SERVO] UP={SERVO_UP_DUTY} DOWN={SERVO_DOWN_DUTY} BCM={SERVO_GPIO_BCM}")
+        print("[POSITION] Press 'R' to record RED zone position, 'B' to record BLUE zone position")
         print("[CMD] type H then Enter to stop and exit")
 
     def ready(self):
@@ -693,13 +621,6 @@ class SimpleCubeMissionV30(Node):
         msg.linear.x = float(linear_x)
         msg.angular.z = float(angular_z)
         self.cmd_pub.publish(msg)
-        
-        self.last_cmd_linear = linear_x
-        self.last_cmd_angular = angular_z
-        
-        self.position_tracker.update_from_velocity(
-            linear_x, angular_z, time.monotonic()
-        )
 
     def stop_robot_once(self):
         self.publish_cmd(0.0, 0.0)
@@ -714,11 +635,8 @@ class SimpleCubeMissionV30(Node):
     def set_state(self, new_state, text=""):
         if self.state == new_state:
             return
-        old_state = self.state
         self.state = new_state
         self.state_enter_time = time.monotonic()
-        
-        # Reset state-specific variables
         if new_state == "SEARCH":
             self.center_seen_frames = 0
             self.approach_lost_frames = 0
@@ -726,30 +644,40 @@ class SimpleCubeMissionV30(Node):
             self.last_seen_target = None
             self.delivery_marker_ids = set()
             self.marker_align_frames = 0
-            self.navigate_target_x = None
-            self.navigate_target_y = None
-            self.navigate_target_yaw = None
-        
-        if new_state == "ACTIVE_CENTER":
+            self.locked_search_color = None
+            self.target_visible = False
+            self.target_obs = None
+            self.red_obs = None
+            self.blue_obs = None
+            self.pickup_position = None
+            self.target_zone_position = None
+        if new_state in ("CENTER_STOP", "BACKTRACK_AFTER_CENTER", "FINE_ALIGN"):
             self.center_seen_frames = 0
-            self.centered_start_time = None
-            self.centered_ready = False
-        
         if new_state == "APPROACH":
             self.approach_lost_frames = 0
-            self.approach_recenter_frames = 0
-            self.approach_is_recentering = False
-        
-        if new_state == "TURN_TO_DELIVERY_MARKER":
-            self.marker_align_frames = 0
-        
-        if new_state == "NAVIGATE_TO_ZONE":
-            self.navigate_start_time = time.monotonic()
-        
+        if new_state == "BACKUP_AFTER_GRAB":
+            self.target_visible = False
+            self.target_obs = None
+            self.red_obs = None
+            self.blue_obs = None
+        if new_state == "RETURN_TO_ZONE_POSITION":
+            # Determine target zone based on cube color
+            if self.grab_color == "red":
+                self.target_zone_position = self.red_zone_position
+            elif self.grab_color == "blue":
+                self.target_zone_position = self.blue_zone_position
+            else:
+                self.target_zone_position = None
+        if new_state == "TURN_AFTER_RELEASE_90":
+            self.target_visible = False
+            self.target_obs = None
+            self.red_obs = None
+            self.blue_obs = None
+            self.locked_search_color = None
         if text:
-            print(f"[STATE] {old_state} -> {new_state} | {text}")
+            print(f"[STATE] {new_state} | {text}")
         else:
-            print(f"[STATE] {old_state} -> {new_state}")
+            print(f"[STATE] {new_state}")
 
     def start_turn_relative(self, radians_delta, state_name):
         self.turn_target_yaw = self.normalize_angle(self.local_yaw + radians_delta)
@@ -763,14 +691,23 @@ class SimpleCubeMissionV30(Node):
         print(f"[STOP] {reason}")
 
     def console_loop(self):
+        """Monitor console for manual commands"""
+        print("[CONSOLE] Commands: H=halt, R=record red zone, B=record blue zone")
         while True:
             try:
-                cmd = input().strip().lower()
+                cmd = input().strip().upper()
             except Exception:
                 return
-            if cmd == "h":
+            
+            if cmd == "H":
                 self.request_shutdown("manual emergency stop")
                 return
+            elif cmd == "R":
+                self.red_zone_position = Position(self.current_position.x, self.current_position.y)
+                print(f"[POSITION] RED zone recorded at ({self.red_zone_position.x:.3f}, {self.red_zone_position.y:.3f})")
+            elif cmd == "B":
+                self.blue_zone_position = Position(self.current_position.x, self.current_position.y)
+                print(f"[POSITION] BLUE zone recorded at ({self.blue_zone_position.x:.3f}, {self.blue_zone_position.y:.3f})")
 
     def scan_callback(self, msg):
         ranges = list(msg.ranges)
@@ -788,10 +725,16 @@ class SimpleCubeMissionV30(Node):
         self.has_scan = True
 
     def odom_callback(self, msg):
+        """Update position and orientation from odometry"""
         self.world_yaw = self.quaternion_to_yaw(msg.pose.pose.orientation)
         if self.init_yaw is None:
             self.init_yaw = self.world_yaw
         self.local_yaw = self.normalize_angle(self.world_yaw - self.init_yaw)
+        
+        # Update position
+        self.current_position.x = msg.pose.pose.position.x
+        self.current_position.y = msg.pose.pose.position.y
+        
         self.has_odom = True
 
     def image_callback(self, msg):
@@ -807,14 +750,26 @@ class SimpleCubeMissionV30(Node):
             self.target_visible = False
             return
 
+        if CAMERA_GAMMA and abs(CAMERA_GAMMA - 1.0) > 1e-6:
+            inv_gamma = 1.0 / CAMERA_GAMMA
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(256)]).astype("uint8")
+            frame = cv2.LUT(frame, table)
+
         self.image_height, self.image_width = frame.shape[:2]
         if not self.image_logged:
             print(f"[IMAGE] compressed size={self.image_width}x{self.image_height}")
             self.image_logged = True
 
-        # Run detection when needed
-        detection_states = ("WAIT_FOR_DATA", "SEARCH", "ACTIVE_CENTER", "APPROACH", "NAVIGATE_TO_ZONE")
-        if self.state in detection_states:
+        try:
+            marker = self.marker_detector.detect(frame)
+        except Exception as exc:
+            print(f"[MARKER] detect failed: {exc}")
+            marker = None
+        self.marker_obs = marker
+        self.marker_visible = marker is not None
+        self.update_zone_from_marker()
+
+        if self.state in ("WAIT_FOR_DATA", "SEARCH", "CENTER_STOP", "BACKTRACK_AFTER_CENTER", "FINE_ALIGN", "APPROACH"):
             try:
                 chosen, red_obs, blue_obs = self.detector.detect(frame, self.active_target_color())
                 self.detect_error_count = 0
@@ -833,50 +788,69 @@ class SimpleCubeMissionV30(Node):
             self.blue_obs = None
             self.target_visible = False
 
-        try:
-            marker = self.marker_detector.detect(frame)
-        except Exception as exc:
-            print(f"[MARKER] detect failed: {exc}")
-            marker = None
-        self.marker_obs = marker
-        self.marker_visible = marker is not None
-        self.update_zone_from_marker()
-
     def target_error_pixels(self):
         if not self.target_visible or self.target_obs is None or self.image_width is None:
             return None
         return self.target_obs.cx - self.image_width / 2.0
 
-    def target_centered(self, tolerance=None):
-        """Check if target is centered within given pixel tolerance"""
-        if tolerance is None:
-            tolerance = SEARCH_CENTER_BAND_PX
+    def target_centered(self):
         err = self.target_error_pixels()
-        return err is not None and abs(err) <= tolerance
-    
-    def target_centered_tight(self):
-        """Check if target is tightly centered for active centering"""
-        return self.target_centered(tolerance=ACTIVE_CENTER_PIXEL_TOL)
+        return err is not None and abs(err) <= SEARCH_CENTER_BAND_PX
 
     def update_zone_from_marker(self):
         if not self.marker_visible or self.marker_obs is None:
             return
+        if self.state not in ZONE_UPDATE_STATES:
+            return
         mid = self.marker_obs.marker_id
-        if mid in RED_ZONE_MARKER_IDS or (mid in RED_ZONE_EDGE_IDS and self.marker_obs.error > 100.0):
+        self.last_marker_id = mid
+
+        if mid in RED_ZONE_MARKER_IDS:
             self.current_zone = "RED_ZONE"
-        elif mid in BLUE_ZONE_MARKER_IDS or (mid in BLUE_ZONE_EDGE_IDS and self.marker_obs.error > 100.0):
+            self.zone_candidate = "RED_ZONE"
+            self.zone_candidate_frames = ZONE_MARKER_STABLE_FRAMES
+            self.last_zone_reason = "direct_red_marker"
+            return
+
+        if mid in BLUE_ZONE_MARKER_IDS:
             self.current_zone = "BLUE_ZONE"
-    
-    def update_zone_from_position(self):
-        pos_zone = self.position_tracker.get_zone()
-        if pos_zone != "BOUNDARY":
-            if self.current_zone == "UNKNOWN":
-                self.current_zone = pos_zone
-                print(f"[ZONE] Position-based: {pos_zone} (x={self.position_tracker.x:.2f})")
+            self.zone_candidate = "BLUE_ZONE"
+            self.zone_candidate_frames = ZONE_MARKER_STABLE_FRAMES
+            self.last_zone_reason = "direct_blue_marker"
+            return
+
+        if mid in NORTH_LINE_MARKER_IDS and self.marker_obs.error > 100.0:
+            self.current_zone = "RED_ZONE"
+            self.zone_candidate = "RED_ZONE"
+            self.zone_candidate_frames = ZONE_MARKER_STABLE_FRAMES
+            self.last_zone_reason = "north_line_buffer"
+            return
+
+        if mid in SOUTH_LINE_MARKER_IDS and self.marker_obs.error > 100.0:
+            self.current_zone = "BLUE_ZONE"
+            self.zone_candidate = "BLUE_ZONE"
+            self.zone_candidate_frames = ZONE_MARKER_STABLE_FRAMES
+            self.last_zone_reason = "south_line_buffer"
+
+    def infer_zone_from_line_marker(self, marker_id):
+        direction = self.search_direction
+        if marker_id in NORTH_LINE_MARKER_IDS:
+            if direction > 0:
+                return "RED_ZONE"
+            if direction < 0:
+                return "BLUE_ZONE"
+        if marker_id in SOUTH_LINE_MARKER_IDS:
+            if direction > 0:
+                return "BLUE_ZONE"
+            if direction < 0:
+                return "RED_ZONE"
+        return "UNKNOWN"
 
     def active_target_color(self):
-        self.update_zone_from_position()
-        
+        if self.locked_search_color is not None:
+            self.current_target_color = self.locked_search_color
+            return self.current_target_color
+
         if self.current_zone == "BLUE_ZONE":
             self.current_target_color = "red"
         elif self.current_zone == "RED_ZONE":
@@ -884,19 +858,6 @@ class SimpleCubeMissionV30(Node):
         else:
             self.current_target_color = DEFAULT_TARGET_COLOR
         return self.current_target_color
-    
-    def is_cube_in_wrong_zone(self, cube_color: str) -> bool:
-        pos_zone = self.position_tracker.get_zone()
-        
-        if pos_zone == "BOUNDARY" or pos_zone == "UNKNOWN":
-            return True
-        
-        if cube_color == "red" and pos_zone == "BLUE_ZONE":
-            return True
-        if cube_color == "blue" and pos_zone == "RED_ZONE":
-            return True
-        
-        return False
 
     def delivery_ids_for_color(self, color):
         if color == "red":
@@ -935,290 +896,106 @@ class SimpleCubeMissionV30(Node):
         close_by_size = bbox_h >= LOST_CAPTURE_CLOSE_BBOX_H_PX
         return close_by_distance or close_by_size
 
-    # ========================================================================
-    # NEW: ACTIVE CENTERING - replaces CENTER_STOP, BACKTRACK, FINE_ALIGN
-    # ========================================================================
-    def handle_active_center(self):
-        """
-        Active centering with feedback control.
-        Rotates to center the cube and holds it centered for minimum duration.
-        No hardcoded backtrack - uses continuous feedback.
-        """
-        if self.front_dist <= EMERGENCY_STOP_M:
-            self.set_state("STOPPED", "emergency front distance")
-            return
-
-        # Timeout protection
-        if self.state_age() > ACTIVE_CENTER_TIMEOUT:
-            print(f"[CENTER] Timeout after {ACTIVE_CENTER_TIMEOUT:.1f}s, retrying search")
-            self.set_state("SEARCH", "centering timeout")
-            return
-
-        # Target lost
-        if not self.target_visible or self.target_obs is None:
-            self.centered_start_time = None
-            self.centered_ready = False
-            self.center_seen_frames = 0
-            
-            if self.state_age() < ACTIVE_CENTER_LOST_RECOVER:
-                # Gentle search in last known direction
-                search_dir = 1.0 if self.search_direction > 0 else -1.0
-                self.publish_cmd(0.0, search_dir * ACTIVE_CENTER_RECOVER_ANG)
-                return
-            
-            print("[CENTER] Target lost, returning to search")
-            self.set_state("SEARCH", "target lost during centering")
-            return
-
-        # Get pixel error
-        err = self.target_error_pixels()
-        if err is None:
-            self.stop_robot_once()
-            return
-
-        err_abs = abs(err)
-        
-        # Check if tightly centered
-        if err_abs <= ACTIVE_CENTER_PIXEL_TOL:
-            self.center_seen_frames += 1
-            
-            # Track when we first achieved center
-            if self.centered_start_time is None:
-                self.centered_start_time = time.monotonic()
-            
-            # Check if we've held center long enough
-            centered_duration = time.monotonic() - self.centered_start_time
-            if centered_duration >= ACTIVE_CENTER_MIN_DURATION and self.center_seen_frames >= 2:
-                if not self.centered_ready:
-                    self.centered_ready = True
-                    print(f"[CENTER] Centered for {centered_duration:.2f}s, ready to approach")
-                
-                self.stop_robot_once()
-                self.grab_color = self.target_obs.color
-                self.remember_target_for_capture()
-                self.set_state("APPROACH", f"{self.grab_color} centered, driving forward")
-                return
-            
-            # Still holding position
-            self.stop_robot_once()
-            return
-        
-        # NOT centered - reset hold tracking
-        self.center_seen_frames = 0
-        self.centered_start_time = None
-        self.centered_ready = False
-        
-        # Calculate angular correction
-        err_norm = err / max(self.image_width / 2.0, 1.0)
-        err_norm_abs = abs(err_norm)
-        
-        # Adaptive gain: slower when close, faster when far
-        if err_norm_abs < ACTIVE_CENTER_DECEL_ZONE:
-            # Close to center - use gentler correction
-            gain = ACTIVE_CENTER_GAIN * (err_norm_abs / ACTIVE_CENTER_DECEL_ZONE)
-            gain = max(gain, 0.3)  # Minimum gain to overcome friction
-        else:
-            # Far from center - use full gain
-            gain = ACTIVE_CENTER_GAIN
-        
-        # Negative sign: counter-steer toward center
-        angular = -gain * err_norm
-        angular = self.clamp_abs(angular, ACTIVE_CENTER_MIN_ANG, ACTIVE_CENTER_MAX_ANG)
-        
-        # Print occasional debug
-        if int(self.state_age() * 10) % 5 == 0:
-            print(f"[CENTER] err={err:.0f}px norm={err_norm:.2f} ang={angular:.3f} gain={gain:.2f}")
-        
-        self.publish_cmd(0.0, angular)
-
-    # ========================================================================
-    # NEW: ADAPTIVE APPROACH with re-centering
-    # ========================================================================
-    def handle_approach(self):
-        """
-        Adaptive approach that maintains centering while driving forward.
-        Can slow down, steer to re-center, then resume full speed.
-        """
-        if self.front_dist <= EMERGENCY_STOP_M:
-            self.set_state("STOPPED", "emergency front distance")
-            return
-
-        # Target lost during approach
-        if not self.target_visible or self.target_obs is None:
-            self.approach_lost_frames += 1
-            self.approach_is_recentering = False
-            self.approach_recenter_frames = 0
-            
-            grace_frames = BLUE_APPROACH_LOST_GRACE_FRAMES if self.grab_color == "blue" else APPROACH_LOST_GRACE_FRAMES
-            
-            if self.approach_lost_frames < grace_frames:
-                # Brief loss - keep moving slowly
-                self.publish_cmd(APPROACH_SPEED * 0.5, 0.0)
-                return
-            
-            # Extended loss - check if cube was close enough
-            if self.last_target_was_close():
-                self.set_state("EXTRA_FORWARD_AFTER_LOST", f"close target disappeared, {self.last_target_summary()}")
-            else:
-                self.stop_robot_once()
-                self.set_state("SEARCH", f"far target lost, {self.last_target_summary()}")
-            return
-
-        # Target is visible
-        self.approach_lost_frames = 0
-        self.remember_target_for_capture()
-        
-        # Get current error
-        err = self.target_error_pixels()
-        if err is None:
-            self.publish_cmd(APPROACH_SPEED * 0.5, 0.0)
-            return
-        
-        err_abs = abs(err)
-        
-        # Determine if we need to re-center
-        cube_off_center = err_abs > APPROACH_CENTER_TOLERANCE
-        
-        if cube_off_center:
-            # Cube has drifted off center - enter re-centering mode
-            if not self.approach_is_recentering:
-                print(f"[APPROACH] Cube off-center ({err:.0f}px), re-centering")
-                self.approach_is_recentering = True
-                self.approach_recenter_frames = 0
-            
-            # Slow down while re-centering
-            approach_speed = APPROACH_RECENTER_SPEED
-            
-            # Calculate steering correction
-            err_norm = err / max(self.image_width / 2.0, 1.0)
-            steer = -APPROACH_STEER_GAIN * err_norm
-            steer = max(-APPROACH_STEER_MAX, min(APPROACH_STEER_MAX, steer))
-            
-            # Check if we're now close enough to center
-            if err_abs <= APPROACH_CENTER_TOLERANCE:
-                self.approach_recenter_frames += 1
-                if self.approach_recenter_frames >= APPROACH_CENTER_HOLD:
-                    print(f"[APPROACH] Re-centered, resuming full approach")
-                    self.approach_is_recentering = False
-                    self.approach_recenter_frames = 0
-                    approach_speed = APPROACH_SPEED
-                    steer = 0.0
-            else:
-                self.approach_recenter_frames = 0
-        else:
-            # Cube is centered - proceed normally
-            if self.approach_is_recentering:
-                self.approach_recenter_frames += 1
-                if self.approach_recenter_frames >= APPROACH_CENTER_HOLD:
-                    print(f"[APPROACH] Re-centered and stable, resuming")
-                    self.approach_is_recentering = False
-                    self.approach_recenter_frames = 0
-                approach_speed = APPROACH_RECENTER_SPEED
-                steer = 0.0
-            else:
-                approach_speed = APPROACH_SPEED
-                
-                # Minor course correction even when centered
-                err_norm = err / max(self.image_width / 2.0, 1.0)
-                steer = -APPROACH_STEER_GAIN * 0.5 * err_norm  # Half gain for minor corrections
-                steer = max(-APPROACH_STEER_MAX * 0.3, min(APPROACH_STEER_MAX * 0.3, steer))
-        
-        # Adjust speed based on distance
-        if self.target_obs.distance_cm < 15.0:
-            approach_speed *= 0.7  # Slow down when very close
-        elif self.target_obs.distance_cm > 60.0:
-            approach_speed = min(approach_speed * 1.2, APPROACH_MAX_SPEED)  # Speed up when far
-        
-        # Print debug info
-        status = "RECENTER" if self.approach_is_recentering else "NORMAL"
-        if int(self.state_age() * 10) % 5 == 0:
-            print(f"[APPROACH] {status} err={err:.0f}px speed={approach_speed:.3f} steer={steer:.3f} dist={self.target_obs.distance_cm:.1f}cm")
-        
-        self.publish_cmd(approach_speed, steer)
-
-    # ========================================================================
-    # SEARCH - initial cube finding
-    # ========================================================================
     def handle_search(self):
         if self.front_dist <= EMERGENCY_STOP_M:
             self.set_state("STOPPED", "emergency front distance")
             return
 
-        if self.moved_cubes >= MAX_CUBES:
-            self.stop_robot_once()
-            if self.state_age() > 3.0:
-                print(f"[MISSION] Complete! Moved {self.moved_cubes} cubes")
-                self.request_shutdown("mission complete")
-            return
-
         self.active_target_color()
-        
-        # Ignore cubes already in correct zone
         if self.target_visible and self.target_obs is not None:
-            if not self.is_cube_in_wrong_zone(self.target_obs.color):
-                print(f"[SEARCH] {self.target_obs.color} cube in correct zone, ignoring")
-                self.target_visible = False
-                self.target_obs = None
-        
-        if self.target_visible and self.target_obs is not None:
+            if self.locked_search_color is None:
+                self.locked_search_color = self.target_obs.color
+                self.current_target_color = self.locked_search_color
             if self.target_centered():
                 self.center_seen_frames += 1
                 self.stop_robot_once()
                 if self.center_seen_frames >= MIN_CENTER_FRAMES:
                     self.grab_color = self.target_obs.color
                     self.remember_target_for_capture()
-                    # Go straight to active centering (replaces old CENTER_STOP/BACKTRACK/FINE_ALIGN)
-                    self.set_state("ACTIVE_CENTER", f"{self.grab_color} found, beginning active centering")
+                    self.set_state("CENTER_STOP", f"{self.grab_color} centered, short stop")
                 return
             self.center_seen_frames = 0
-
-        # Navigate to other zone if needed
-        if self.completed_cycles > 0 and self.state_age() > 5.0:
-            target_x = -0.5 if self.position_tracker.x > 0 else 0.5
-            self.navigate_target_x = target_x
-            self.navigate_target_y = self.position_tracker.y
-            self.set_state("NAVIGATE_TO_ZONE", f"moving to x={target_x:.1f}")
+            err = self.target_error_pixels()
+            if err is None:
+                self.stop_robot_once()
+                return
+            err_norm = err / max(self.image_width / 2.0, 1.0)
+            angular = self.clamp_abs(-0.24 * err_norm, 0.045, SEARCH_ANG)
+            self.publish_cmd(0.0, angular)
             return
 
         self.publish_cmd(0.0, self.search_direction * SEARCH_ANG)
 
-    def handle_navigate_to_zone(self):
+    def handle_center_stop(self):
+        self.stop_robot_once()
+        if self.state_age() >= CENTER_STOP_SEC:
+            self.set_state("FINE_ALIGN", "quick fine align")
+
+    def handle_backtrack_after_center(self):
+        if self.state_age() < BACKTRACK_AFTER_CENTER_SEC:
+            self.publish_cmd(0.0, BACKTRACK_AFTER_CENTER_ANG)
+            return
+        self.stop_robot_once()
+        self.set_state("FINE_ALIGN", "fine align")
+
+    def handle_fine_align(self):
         if self.front_dist <= EMERGENCY_STOP_M:
             self.set_state("STOPPED", "emergency front distance")
             return
-        
-        if self.navigate_target_x is None:
-            self.set_state("SEARCH", "no navigation target")
-            return
-        
-        dist = self.position_tracker.get_distance_to(self.navigate_target_x, self.navigate_target_y)
-        if dist < NAVIGATE_TARGET_DISTANCE_M:
-            print(f"[NAV] Reached target position (dist={dist:.2f}m)")
-            self.set_state("SEARCH", "arrived at navigation target")
-            return
-        
-        if self.state_age() > 15.0:
-            print("[NAV] Navigation timeout")
-            self.set_state("SEARCH", "navigation timeout")
-            return
-        
-        # Check for cubes while navigating
-        if self.target_visible and self.target_obs and self.is_cube_in_wrong_zone(self.target_obs.color):
-            print("[NAV] Found cube while navigating, switching to search")
-            self.set_state("SEARCH", "found cube during navigation")
-            return
-        
-        target_angle = self.position_tracker.get_angle_to(self.navigate_target_x, self.navigate_target_y)
-        
-        angular = self.clamp_abs(0.5 * target_angle, 0.05, NAVIGATE_TO_ZONE_ANG)
-        linear = NAVIGATE_TO_ZONE_SPEED * (1.0 - abs(target_angle) / math.pi)
-        linear = max(0.02, linear)
-        
-        self.publish_cmd(linear, angular)
 
-    # ========================================================================
-    # REMAINING HANDLERS (mostly unchanged from original)
-    # ========================================================================
+        if not self.target_visible or self.target_obs is None:
+            if self.state_age() < FINE_ALIGN_LOST_RECOVER_SEC:
+                self.publish_cmd(0.0, FINE_ALIGN_SEARCH_ANG)
+                return
+            self.set_state("SEARCH", "target lost after fine-align recovery")
+            return
+
+        err = self.target_error_pixels()
+        if err is None:
+            self.stop_robot_once()
+            return
+
+        if abs(err) <= FINE_ALIGN_PIXEL_TOL:
+            self.center_seen_frames += 1
+            self.stop_robot_once()
+            if self.center_seen_frames >= FINE_ALIGN_HOLD_FRAMES:
+                self.grab_color = self.target_obs.color
+                self.remember_target_for_capture()
+                self.set_state("APPROACH", f"{self.grab_color} fine aligned, drive straight")
+            return
+
+        self.center_seen_frames = 0
+        err_norm = err / max(self.image_width / 2.0, 1.0)
+        angular = self.clamp_abs(-0.18 * err_norm, FINE_ALIGN_MIN_ANG, FINE_ALIGN_MAX_ANG)
+        self.publish_cmd(0.0, angular)
+
+    def handle_approach(self):
+        if self.front_dist <= EMERGENCY_STOP_M:
+            self.set_state("STOPPED", "emergency front distance")
+            return
+
+        if not self.target_visible or self.target_obs is None:
+            self.approach_lost_frames += 1
+            grace_frames = BLUE_APPROACH_LOST_GRACE_FRAMES if self.grab_color == "blue" else APPROACH_LOST_GRACE_FRAMES
+            if self.approach_lost_frames < grace_frames:
+                self.publish_cmd(APPROACH_SPEED * 0.65, 0.0)
+                return
+            if self.last_target_was_close():
+                # Record pickup position
+                self.pickup_position = Position(self.current_position.x, self.current_position.y)
+                self.set_state("EXTRA_FORWARD_AFTER_LOST", f"close target disappeared, {self.last_target_summary()}")
+            else:
+                self.stop_robot_once()
+                self.set_state("SEARCH", f"far target lost, no grab, {self.last_target_summary()}")
+            return
+
+        self.approach_lost_frames = 0
+        self.remember_target_for_capture()
+        err = self.target_error_pixels()
+        steer = 0.0 if err is None else -APPROACH_STEER_GAIN * err
+        steer = max(-APPROACH_STEER_MAX, min(APPROACH_STEER_MAX, steer))
+        self.publish_cmd(APPROACH_SPEED, steer)
+
     def handle_extra_forward_after_lost(self):
         if self.state_age() < EXTRA_FORWARD_AFTER_LOST_SEC:
             self.publish_cmd(EXTRA_FORWARD_SPEED, 0.0)
@@ -1232,49 +1009,49 @@ class SimpleCubeMissionV30(Node):
         time.sleep(0.12)
         self.servo.servo_down()
         self.delivery_marker_ids = self.delivery_ids_for_color(self.grab_color)
-        self.set_state("TURN_TO_DELIVERY_MARKER", f"find marker ids={sorted(self.delivery_marker_ids)}")
+        
+        # Determine delivery method based on zone positions
+        if self.grab_color == "red" and self.red_zone_position is not None:
+            self.set_state("BACKUP_AFTER_GRAB", f"grabbed {self.grab_color}, will return to recorded RED zone")
+        elif self.grab_color == "blue" and self.blue_zone_position is not None:
+            self.set_state("BACKUP_AFTER_GRAB", f"grabbed {self.grab_color}, will return to recorded BLUE zone")
+        else:
+            print(f"[WARNING] No recorded position for {self.grab_color} zone, cannot use position-based delivery")
+            self.set_state("STOPPED", f"No zone position recorded for {self.grab_color}")
 
-    def handle_turn_to_delivery_marker(self):
-        if self.state_age() > MARKER_TURN_TIMEOUT_SEC:
-            self.stop_robot_once()
-            if self.grab_color == "red":
-                self.navigate_target_x = 0.5
-                self.navigate_target_y = self.position_tracker.y
-                self.set_state("NAVIGATE_TO_ZONE", f"marker not found, navigating to red zone")
-            else:
-                self.navigate_target_x = -0.5
-                self.navigate_target_y = self.position_tracker.y
-                self.set_state("NAVIGATE_TO_ZONE", f"marker not found, navigating to blue zone")
-            return
-
-        if not self.marker_visible or self.marker_obs is None or self.marker_obs.marker_id not in self.delivery_marker_ids:
-            self.marker_align_frames = 0
-            self.publish_cmd(0.0, MARKER_TURN_SPEED)
-            return
-
-        err = self.marker_obs.error
-        if abs(err) <= MARKER_ALIGN_PIXEL_TOL:
-            self.marker_align_frames += 1
-            self.stop_robot_once()
-            if self.marker_align_frames >= MARKER_ALIGN_HOLD_FRAMES:
-                self.set_state("DRIVE_TO_DELIVERY_ZONE", f"marker {self.marker_obs.marker_id} aligned")
-            return
-
-        self.marker_align_frames = 0
-        err_norm = err / max(self.image_width / 2.0, 1.0)
-        angular = self.clamp_abs(-0.28 * err_norm, 0.045, MARKER_TURN_SPEED)
-        self.publish_cmd(0.0, angular)
-
-    def handle_drive_to_delivery_zone(self):
-        if self.state_age() < DELIVERY_FORWARD_SEC:
-            steer = 0.0
-            if self.marker_visible and self.marker_obs is not None and self.marker_obs.marker_id in self.delivery_marker_ids:
-                steer = -0.0015 * self.marker_obs.error
-                steer = max(-0.10, min(0.10, steer))
-            self.publish_cmd(DELIVERY_FORWARD_SPEED, steer)
+    def handle_backup_after_grab(self):
+        """Short backup to secure cube before returning to zone"""
+        if self.state_age() < BACKUP_AFTER_GRAB_SEC:
+            self.publish_cmd(BACKUP_AFTER_GRAB_SPEED, 0.0)
             return
         self.stop_robot_once()
-        self.set_state("SERVO_UP_RELEASE", "raise arm")
+        self.set_state("RETURN_TO_ZONE_POSITION", f"returning to {self.grab_color} zone position")
+
+    def handle_return_to_zone_position(self):
+        """Navigate backward to the recorded zone position"""
+        if self.target_zone_position is None:
+            self.stop_robot_once()
+            self.set_state("STOPPED", "No target zone position available")
+            return
+        
+        # Check timeout
+        if self.state_age() > RETURN_TO_ZONE_TIMEOUT_SEC:
+            self.stop_robot_once()
+            self.set_state("SERVO_UP_RELEASE", "return to zone timeout, releasing")
+            return
+        
+        # Calculate distance to target zone
+        distance_to_zone = self.current_position.distance_to(self.target_zone_position)
+        
+        # Check if we've reached the zone
+        if distance_to_zone <= RETURN_TO_ZONE_POSITION_TOLERANCE:
+            self.stop_robot_once()
+            self.set_state("SERVO_UP_RELEASE", f"reached {self.grab_color} zone (dist={distance_to_zone:.3f}m)")
+            return
+        
+        # Move backward toward zone
+        # Simple backward motion - could add steering based on angle to target
+        self.publish_cmd(-RETURN_TO_ZONE_SPEED, 0.0)
 
     def handle_servo_up_release(self):
         self.stop_robot_reliable(repeat=5, delay=0.02)
@@ -1287,26 +1064,19 @@ class SimpleCubeMissionV30(Node):
             return
         self.stop_robot_once()
         self.completed_cycles += 1
-        self.moved_cubes += 1
         self.servo.servo_up()
-        self.search_direction = SEARCH_AFTER_RELEASE_DIRECTION
         
-        print(f"[MISSION] Cubes moved: {self.moved_cubes}/{MAX_CUBES}")
+        # Update current zone based on what we just delivered
+        if self.grab_color == "red":
+            self.current_zone = "RED_ZONE"
+            self.last_zone_reason = "released_red_in_red_zone"
+        elif self.grab_color == "blue":
+            self.current_zone = "BLUE_ZONE"
+            self.last_zone_reason = "released_blue_in_blue_zone"
         
-        if self.moved_cubes < MAX_CUBES:
-            pos_zone = self.position_tracker.get_zone()
-            if pos_zone == "RED_ZONE":
-                self.navigate_target_x = -0.5
-                self.navigate_target_y = self.position_tracker.y
-                self.set_state("NAVIGATE_TO_ZONE", f"heading to blue zone for remaining cubes")
-            elif pos_zone == "BLUE_ZONE":
-                self.navigate_target_x = 0.5
-                self.navigate_target_y = self.position_tracker.y
-                self.set_state("NAVIGATE_TO_ZONE", f"heading to red zone for remaining cubes")
-            else:
-                self.set_state("SEARCH", f"continue searching, cycles={self.completed_cycles}")
-        else:
-            self.set_state("SEARCH", f"all {MAX_CUBES} cubes moved, mission complete")
+        # Restart search
+        self.search_direction = SEARCH_START_DIRECTION
+        self.set_state("SEARCH", f"restart search, cycles={self.completed_cycles}")
 
     def control_loop(self):
         if self.shutdown_requested:
@@ -1331,15 +1101,16 @@ class SimpleCubeMissionV30(Node):
 
         handlers = {
             "SEARCH": self.handle_search,
-            "ACTIVE_CENTER": self.handle_active_center,  # NEW - replaces 3 states
+            "CENTER_STOP": self.handle_center_stop,
+            "BACKTRACK_AFTER_CENTER": self.handle_backtrack_after_center,
+            "FINE_ALIGN": self.handle_fine_align,
             "APPROACH": self.handle_approach,
             "EXTRA_FORWARD_AFTER_LOST": self.handle_extra_forward_after_lost,
             "SERVO_DOWN": self.handle_servo_down,
-            "TURN_TO_DELIVERY_MARKER": self.handle_turn_to_delivery_marker,
-            "DRIVE_TO_DELIVERY_ZONE": self.handle_drive_to_delivery_zone,
+            "BACKUP_AFTER_GRAB": self.handle_backup_after_grab,
+            "RETURN_TO_ZONE_POSITION": self.handle_return_to_zone_position,
             "SERVO_UP_RELEASE": self.handle_servo_up_release,
             "BACKUP_AFTER_RELEASE": self.handle_backup_after_release,
-            "NAVIGATE_TO_ZONE": self.handle_navigate_to_zone,
             "STOPPED": self.stop_robot_once,
         }
         handlers.get(self.state, self.stop_robot_once)()
@@ -1359,22 +1130,27 @@ class SimpleCubeMissionV30(Node):
                 f"target={self.target_obs.color} err={err:.0f} "
                 f"bbox=({self.target_obs.bbox_w}x{self.target_obs.bbox_h}) "
                 f"holes={self.target_obs.holes} dist={self.target_obs.distance_cm:.1f}cm "
+                f"center_frames={self.center_seen_frames}"
             )
         
-        # Show centering status if active
-        center_info = ""
-        if self.state == "ACTIVE_CENTER" and self.centered_start_time is not None:
-            dur = time.monotonic() - self.centered_start_time
-            center_info = f"centered_for={dur:.2f}s "
+        # Position info
+        red_pos_text = f"({self.red_zone_position.x:.2f},{self.red_zone_position.y:.2f})" if self.red_zone_position else "unset"
+        blue_pos_text = f"({self.blue_zone_position.x:.2f},{self.blue_zone_position.y:.2f})" if self.blue_zone_position else "unset"
+        
+        # Distance to target zone during delivery
+        zone_dist_text = ""
+        if self.state == "RETURN_TO_ZONE_POSITION" and self.target_zone_position:
+            dist = self.current_position.distance_to(self.target_zone_position)
+            zone_dist_text = f" zone_dist={dist:.3f}m"
 
         print(
-            f"[STATUS] {self.state} {center_info}{target_text} grab={self.grab_color} "
-            f"zone={self.current_zone} want={self.current_target_color} "
+            f"[STATUS] {self.state} {target_text} grab={self.grab_color} "
+            f"pos=({self.current_position.x:.2f},{self.current_position.y:.2f}) "
+            f"red_zone={red_pos_text} blue_zone={blue_pos_text}{zone_dist_text} "
+            f"zone={self.current_zone} want={self.current_target_color} lock={self.locked_search_color} "
             f"marker={self.marker_obs.marker_id if self.marker_obs else 'none'} "
-            f"front={self.front_dist:.3f}m "
-            f"cubes={self.moved_cubes}/{MAX_CUBES} "
-            f"pos=({self.position_tracker.x:.2f},{self.position_tracker.y:.2f}) "
-            f"errors={self.detect_error_count}"
+            f"front={self.front_dist:.3f}m yaw={math.degrees(self.local_yaw):.0f} "
+            f"cycles={self.completed_cycles}"
         )
 
     def destroy_node(self):
@@ -1391,7 +1167,7 @@ class SimpleCubeMissionV30(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SimpleCubeMissionV30()
+    node = SimpleCubeMissionV42()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
