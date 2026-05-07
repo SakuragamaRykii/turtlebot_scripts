@@ -60,17 +60,34 @@ MARKER_TURN_TIMEOUT_SEC = 35.0
 MARKER_TIMEOUT_STOP = True
 ZONE_MARKER_STABLE_FRAMES = 3
 
-# Position-based delivery settings
-RETURN_TO_ZONE_SPEED = 0.14
-RETURN_TO_ZONE_POSITION_TOLERANCE = 0.10  # meters
-RETURN_TO_ZONE_TIMEOUT_SEC = 20.0
+# NEW: Position-based delivery parameters
+POSITION_BASED_DELIVERY = True       # Use position instead of marker search for delivery
+DELIVERY_BACKWARD_SPEED = -0.10      # Speed when backing into delivery zone
+DELIVERY_BACKWARD_STEER_MAX = 0.12   # Max steering correction while backing
+DELIVERY_BACKWARD_STEER_GAIN = 0.003 # Steering gain while backing
+DELIVERY_BACKWARD_TIMEOUT_SEC = 20.0 # Max time for backward delivery
+ZONE_DELIVERY_X_THRESHOLD = 0.15     # X position considered "in zone" for delivery (meters)
+ZONE_BOUNDARY_X = 0.0                # x > 0 = red zone, x < 0 = blue zone
 
+DELIVERY_FORWARD_SPEED = 0.116
+DELIVERY_FORWARD_MIN_SEC = 5.0
+DELIVERY_FORWARD_MAX_SEC = 15.0
+DELIVERY_MARKER_LOST_RELEASE_FRAMES = 6
+DELIVERY_MARKER_TOO_CLOSE_WIDTH = 155.0
+DELIVERY_STEER_GAIN = 0.0022
+DELIVERY_STEER_MAX = 0.14
 BACKUP_SPEED = -0.26
 BACKUP_AFTER_RELEASE_SEC = 1.0
 TURN_AFTER_RELEASE_DEG = -90.0
 TURN_AFTER_RELEASE_TOL_DEG = 5.0
 TURN_AFTER_RELEASE_SPEED = 0.20
-RETURN_CENTER_AFTER_RELEASE = False  # Disabled since we use position-based return
+RETURN_CENTER_AFTER_RELEASE = True
+RETURN_CENTER_TARGET_MARKER_WIDTH = 41.0
+RETURN_CENTER_WIDTH_TOL = 2.0
+RETURN_CENTER_SPEED = 0.12
+RETURN_CENTER_STEER_GAIN = 0.0030
+RETURN_CENTER_STEER_MAX = 0.18
+RETURN_CENTER_TIMEOUT_SEC = 8.0
 
 EMERGENCY_STOP_CM = 3.0
 EMERGENCY_STOP_M = EMERGENCY_STOP_CM / 100.0
@@ -123,6 +140,13 @@ STATUS_DT = 0.8
 CAMERA_GAMMA = 1.5
 
 
+# =========================
+# Position tracking tuning (NEW)
+# =========================
+POSITION_HISTORY_SEC = 2.0
+MAX_CUBES = 4
+
+
 @dataclass
 class CubeObservation:
     color: str
@@ -153,13 +177,108 @@ class MarkerObservation:
 
 
 @dataclass
-class Position:
+class RobotPosition:
+    """Tracks robot position with timestamp for history"""
     x: float
     y: float
+    yaw: float
+    timestamp: float
+
+
+class PositionTracker:
+    """Tracks robot position using velocity integration from cmd_vel"""
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+        self.last_update_time = None
+        self.position_history = []
+        
+    def update_from_velocity(self, linear_x: float, angular_z: float, current_time: float):
+        """Update position based on velocity commands (dead reckoning)"""
+        if self.last_update_time is None:
+            self.last_update_time = current_time
+            return
+            
+        dt = current_time - self.last_update_time
+        if dt <= 0 or dt > 1.0:  # Prevent large jumps
+            self.last_update_time = current_time
+            return
+            
+        # Simple differential drive model
+        if abs(angular_z) < 1e-6:
+            # Straight movement
+            self.x += linear_x * math.cos(self.yaw) * dt
+            self.y += linear_x * math.sin(self.yaw) * dt
+        else:
+            # Arc movement
+            radius = linear_x / angular_z
+            d_theta = angular_z * dt
+            self.x += radius * (math.sin(self.yaw + d_theta) - math.sin(self.yaw))
+            self.y -= radius * (math.cos(self.yaw + d_theta) - math.cos(self.yaw))
+            self.yaw += d_theta
+            
+        self.yaw = self.normalize_angle(self.yaw)
+        self.last_update_time = current_time
+        
+        # Store position history
+        self.position_history.append(RobotPosition(
+            x=self.x, y=self.y, yaw=self.yaw, timestamp=current_time
+        ))
+        
+        # Clean old history
+        cutoff = current_time - POSITION_HISTORY_SEC
+        self.position_history = [p for p in self.position_history if p.timestamp > cutoff]
     
-    def distance_to(self, other):
-        """Calculate Euclidean distance to another position"""
-        return math.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
+    def normalize_angle(self, angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
+    
+    def get_zone(self) -> str:
+        """Determine which zone the robot is in based on x position"""
+        if self.x > ZONE_BOUNDARY_X:
+            return "RED_ZONE"
+        elif self.x < -ZONE_BOUNDARY_X:
+            return "BLUE_ZONE"
+        return "BOUNDARY"
+    
+    def get_distance_to(self, target_x: float, target_y: float) -> float:
+        """Get Euclidean distance to a target point"""
+        return math.sqrt((self.x - target_x)**2 + (self.y - target_y)**2)
+    
+    def get_angle_to(self, target_x: float, target_y: float) -> float:
+        """Get angle from current heading to a target point"""
+        dx = target_x - self.x
+        dy = target_y - self.y
+        target_angle = math.atan2(dy, dx)
+        return self.normalize_angle(target_angle - self.yaw)
+    
+    def is_in_zone(self, target_zone: str) -> bool:
+        """Check if robot position is within the specified zone"""
+        if target_zone == "RED_ZONE":
+            return self.x >= ZONE_DELIVERY_X_THRESHOLD
+        elif target_zone == "BLUE_ZONE":
+            return self.x <= -ZONE_DELIVERY_X_THRESHOLD
+        return False
+    
+    def get_zone_for_cube(self, cube_color: str) -> str:
+        """Return the correct zone for a cube color"""
+        if cube_color == "red":
+            return "RED_ZONE"
+        return "BLUE_ZONE"
+    
+    def get_zone_boundary_x(self, zone: str) -> float:
+        """Return the x position threshold for a zone"""
+        if zone == "RED_ZONE":
+            return ZONE_DELIVERY_X_THRESHOLD
+        return -ZONE_DELIVERY_X_THRESHOLD
+    
+    def reset_position(self):
+        """Reset position to origin"""
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+        self.position_history.clear()
+        print("[POS] Position reset to (0,0)")
 
 
 class ServoHelper:
@@ -524,6 +643,15 @@ class SimpleCubeMissionV42(Node):
         self.detector = CubeDetector()
         self.marker_detector = MarkerDetector()
         self.servo = ServoHelper()
+        
+        # NEW: Position tracking system
+        self.position_tracker = PositionTracker()
+        self.last_cmd_linear = 0.0
+        self.last_cmd_angular = 0.0
+        
+        # NEW: Mission tracking
+        self.moved_cubes = 0
+        self.grab_position_x = None  # Store position where cube was grabbed
 
         self.has_scan = False
         self.has_odom = False
@@ -533,18 +661,10 @@ class SimpleCubeMissionV42(Node):
         self.image_height = None
         self.image_logged = False
 
-        # Odometry tracking
-        self.current_position = Position(0.0, 0.0)
         self.world_yaw = 0.0
         self.init_yaw = None
         self.local_yaw = 0.0
         self.turn_target_yaw = 0.0
-
-        # Zone position tracking
-        self.red_zone_position = None
-        self.blue_zone_position = None
-        self.pickup_position = None  # Position where cube was grabbed
-        self.target_zone_position = None  # Where to deliver current cube
 
         self.target_visible = False
         self.target_obs = None
@@ -580,19 +700,14 @@ class SimpleCubeMissionV42(Node):
         self.console_thread = threading.Thread(target=self.console_loop, daemon=True)
         self.console_thread.start()
 
-        print("[BOOT] SimpleCubeMission v42 - Position-Based Delivery")
+        print("[BOOT] SimpleCubeMission v42 with Position Tracking")
         print("[MODE] full standalone, compressed camera only")
-        print("[FLOW] fast lock: search -> short stop -> fine align -> approach with steering -> lost -> forward 1.2s -> arm down")
-        print("[FLOW] after arm down: position-based backward delivery to recorded zone")
-        print("[FLOW] after release: backup 1s -> search")
-        print("[VISION] gamma corrected, Group9-style HSV red/blue masks")
-        print(
-            f"[MARKER] RED_ZONE={sorted(RED_ZONE_MARKER_IDS)} BLUE_ZONE={sorted(BLUE_ZONE_MARKER_IDS)} "
-            f"NORTH_LINE={sorted(NORTH_LINE_MARKER_IDS)} SOUTH_LINE={sorted(SOUTH_LINE_MARKER_IDS)}"
-        )
-        print(f"[TARGET] default={DEFAULT_TARGET_COLOR}, blue-zone=>red cube, red-zone=>blue cube")
-        print(f"[SERVO] UP={SERVO_UP_DUTY} DOWN={SERVO_DOWN_DUTY} BCM={SERVO_GPIO_BCM}")
-        print("[POSITION] Press 'R' to record RED zone position, 'B' to record BLUE zone position")
+        print("[POSITION] Tracking active - initial position (0, 0)")
+        print(f"[POSITION] x > {ZONE_BOUNDARY_X} = RED_ZONE, x < -{ZONE_BOUNDARY_X} = BLUE_ZONE")
+        print(f"[DELIVERY] Position-based delivery: {POSITION_BASED_DELIVERY}")
+        if POSITION_BASED_DELIVERY:
+            print(f"[DELIVERY] Backward speed: {DELIVERY_BACKWARD_SPEED} m/s")
+            print(f"[DELIVERY] Zone threshold: ±{ZONE_DELIVERY_X_THRESHOLD}m")
         print("[CMD] type H then Enter to stop and exit")
 
     def ready(self):
@@ -621,6 +736,11 @@ class SimpleCubeMissionV42(Node):
         msg.linear.x = float(linear_x)
         msg.angular.z = float(angular_z)
         self.cmd_pub.publish(msg)
+        
+        # NEW: Update position tracker with velocity commands
+        self.last_cmd_linear = linear_x
+        self.last_cmd_angular = angular_z
+        self.position_tracker.update_from_velocity(linear_x, angular_z, time.monotonic())
 
     def stop_robot_once(self):
         self.publish_cmd(0.0, 0.0)
@@ -635,6 +755,7 @@ class SimpleCubeMissionV42(Node):
     def set_state(self, new_state, text=""):
         if self.state == new_state:
             return
+        old_state = self.state
         self.state = new_state
         self.state_enter_time = time.monotonic()
         if new_state == "SEARCH":
@@ -649,35 +770,50 @@ class SimpleCubeMissionV42(Node):
             self.target_obs = None
             self.red_obs = None
             self.blue_obs = None
-            self.pickup_position = None
-            self.target_zone_position = None
+            self.grab_position_x = None
         if new_state in ("CENTER_STOP", "BACKTRACK_AFTER_CENTER", "FINE_ALIGN"):
             self.center_seen_frames = 0
         if new_state == "APPROACH":
             self.approach_lost_frames = 0
+        if new_state == "TURN_TO_DELIVERY_MARKER":
+            self.marker_align_frames = 0
         if new_state == "BACKUP_AFTER_GRAB":
             self.target_visible = False
             self.target_obs = None
             self.red_obs = None
             self.blue_obs = None
-        if new_state == "RETURN_TO_ZONE_POSITION":
-            # Determine target zone based on cube color
-            if self.grab_color == "red":
-                self.target_zone_position = self.red_zone_position
-            elif self.grab_color == "blue":
-                self.target_zone_position = self.blue_zone_position
-            else:
-                self.target_zone_position = None
+            # NEW: Record position where cube was grabbed
+            self.grab_position_x = self.position_tracker.x
+            print(f"[POS] Cube grabbed at x={self.grab_position_x:.2f}m")
+        if new_state == "DRIVE_TO_DELIVERY_ZONE":
+            self.delivery_marker_lost_frames = 0
+            self.delivery_marker_seen_once = False
+            if (
+                self.marker_visible
+                and self.marker_obs is not None
+                and self.marker_obs.marker_id in self.delivery_marker_ids
+            ):
+                self.delivery_marker_seen_once = True
+        if new_state == "BACKWARD_DELIVERY":
+            print(f"[DELIVERY] Starting backward delivery of {self.grab_color} cube")
+            print(f"[DELIVERY] Current pos: ({self.position_tracker.x:.2f}, {self.position_tracker.y:.2f})")
+            print(f"[DELIVERY] Target zone: {self.position_tracker.get_zone_for_cube(self.grab_color or 'red')}")
         if new_state == "TURN_AFTER_RELEASE_90":
             self.target_visible = False
             self.target_obs = None
             self.red_obs = None
             self.blue_obs = None
             self.locked_search_color = None
+        if new_state == "RETURN_CENTER_AFTER_RELEASE":
+            self.target_visible = False
+            self.target_obs = None
+            self.red_obs = None
+            self.blue_obs = None
+            self.locked_search_color = None
         if text:
-            print(f"[STATE] {new_state} | {text}")
+            print(f"[STATE] {old_state} -> {new_state} | {text}")
         else:
-            print(f"[STATE] {new_state}")
+            print(f"[STATE] {old_state} -> {new_state}")
 
     def start_turn_relative(self, radians_delta, state_name):
         self.turn_target_yaw = self.normalize_angle(self.local_yaw + radians_delta)
@@ -691,23 +827,21 @@ class SimpleCubeMissionV42(Node):
         print(f"[STOP] {reason}")
 
     def console_loop(self):
-        """Monitor console for manual commands"""
-        print("[CONSOLE] Commands: H=halt, R=record red zone, B=record blue zone")
         while True:
             try:
-                cmd = input().strip().upper()
+                cmd = input().strip().lower()
             except Exception:
                 return
-            
-            if cmd == "H":
+            if cmd == "h":
                 self.request_shutdown("manual emergency stop")
                 return
-            elif cmd == "R":
-                self.red_zone_position = Position(self.current_position.x, self.current_position.y)
-                print(f"[POSITION] RED zone recorded at ({self.red_zone_position.x:.3f}, {self.red_zone_position.y:.3f})")
-            elif cmd == "B":
-                self.blue_zone_position = Position(self.current_position.x, self.current_position.y)
-                print(f"[POSITION] BLUE zone recorded at ({self.blue_zone_position.x:.3f}, {self.blue_zone_position.y:.3f})")
+            elif cmd == "p":
+                # NEW: Print current position
+                print(f"[POS] Current: x={self.position_tracker.x:.2f}m, y={self.position_tracker.y:.2f}m, yaw={math.degrees(self.position_tracker.yaw):.0f}°")
+                print(f"[POS] Zone: {self.position_tracker.get_zone()}")
+            elif cmd == "r":
+                # NEW: Reset position
+                self.position_tracker.reset_position()
 
     def scan_callback(self, msg):
         ranges = list(msg.ranges)
@@ -725,16 +859,10 @@ class SimpleCubeMissionV42(Node):
         self.has_scan = True
 
     def odom_callback(self, msg):
-        """Update position and orientation from odometry"""
         self.world_yaw = self.quaternion_to_yaw(msg.pose.pose.orientation)
         if self.init_yaw is None:
             self.init_yaw = self.world_yaw
         self.local_yaw = self.normalize_angle(self.world_yaw - self.init_yaw)
-        
-        # Update position
-        self.current_position.x = msg.pose.pose.position.x
-        self.current_position.y = msg.pose.pose.position.y
-        
         self.has_odom = True
 
     def image_callback(self, msg):
@@ -832,6 +960,15 @@ class SimpleCubeMissionV42(Node):
             self.zone_candidate_frames = ZONE_MARKER_STABLE_FRAMES
             self.last_zone_reason = "south_line_buffer"
 
+    # NEW: Update zone from position tracking
+    def update_zone_from_position(self):
+        pos_zone = self.position_tracker.get_zone()
+        if pos_zone != "BOUNDARY":
+            if self.current_zone == "UNKNOWN":
+                self.current_zone = pos_zone
+                self.last_zone_reason = f"position_tracker_{pos_zone.lower()}"
+                print(f"[ZONE] Position-based: {pos_zone} (x={self.position_tracker.x:.2f})")
+
     def infer_zone_from_line_marker(self, marker_id):
         direction = self.search_direction
         if marker_id in NORTH_LINE_MARKER_IDS:
@@ -847,6 +984,9 @@ class SimpleCubeMissionV42(Node):
         return "UNKNOWN"
 
     def active_target_color(self):
+        # NEW: Also update zone from position
+        self.update_zone_from_position()
+        
         if self.locked_search_color is not None:
             self.current_target_color = self.locked_search_color
             return self.current_target_color
@@ -858,6 +998,17 @@ class SimpleCubeMissionV42(Node):
         else:
             self.current_target_color = DEFAULT_TARGET_COLOR
         return self.current_target_color
+    
+    # NEW: Check if cube is in wrong zone
+    def is_cube_in_wrong_zone(self, cube_color: str) -> bool:
+        """Check if a cube of given color is in the wrong zone based on position"""
+        pos_zone = self.position_tracker.get_zone()
+        
+        if pos_zone == "BOUNDARY" or pos_zone == "UNKNOWN":
+            return True  # Can't determine - process any cube
+        
+        target_zone = self.position_tracker.get_zone_for_cube(cube_color)
+        return pos_zone != target_zone
 
     def delivery_ids_for_color(self, color):
         if color == "red":
@@ -902,6 +1053,15 @@ class SimpleCubeMissionV42(Node):
             return
 
         self.active_target_color()
+        
+        # NEW: Check if visible cube is in wrong zone (should be moved)
+        if self.target_visible and self.target_obs is not None:
+            if not self.is_cube_in_wrong_zone(self.target_obs.color):
+                print(f"[SEARCH] {self.target_obs.color} cube already in correct zone, ignoring")
+                self.target_visible = False
+                self.target_obs = None
+                # Continue searching
+        
         if self.target_visible and self.target_obs is not None:
             if self.locked_search_color is None:
                 self.locked_search_color = self.target_obs.color
@@ -981,8 +1141,6 @@ class SimpleCubeMissionV42(Node):
                 self.publish_cmd(APPROACH_SPEED * 0.65, 0.0)
                 return
             if self.last_target_was_close():
-                # Record pickup position
-                self.pickup_position = Position(self.current_position.x, self.current_position.y)
                 self.set_state("EXTRA_FORWARD_AFTER_LOST", f"close target disappeared, {self.last_target_summary()}")
             else:
                 self.stop_robot_once()
@@ -1010,48 +1168,135 @@ class SimpleCubeMissionV42(Node):
         self.servo.servo_down()
         self.delivery_marker_ids = self.delivery_ids_for_color(self.grab_color)
         
-        # Determine delivery method based on zone positions
-        if self.grab_color == "red" and self.red_zone_position is not None:
-            self.set_state("BACKUP_AFTER_GRAB", f"grabbed {self.grab_color}, will return to recorded RED zone")
-        elif self.grab_color == "blue" and self.blue_zone_position is not None:
-            self.set_state("BACKUP_AFTER_GRAB", f"grabbed {self.grab_color}, will return to recorded BLUE zone")
+        # NEW: Decide delivery method based on mode
+        if POSITION_BASED_DELIVERY:
+            # Use position-based backward delivery
+            print(f"[DELIVERY] Position-based delivery for {self.grab_color} cube")
+            print(f"[DELIVERY] Current x: {self.position_tracker.x:.2f}m")
+            self.set_state("BACKWARD_DELIVERY", f"backing into {self.position_tracker.get_zone_for_cube(self.grab_color or 'red')}")
         else:
-            print(f"[WARNING] No recorded position for {self.grab_color} zone, cannot use position-based delivery")
-            self.set_state("STOPPED", f"No zone position recorded for {self.grab_color}")
+            # Original marker-based delivery
+            self.set_state("BACKUP_AFTER_GRAB", f"backup 0.7s before turn, marker ids={sorted(self.delivery_marker_ids)}")
+
+    # ========================================================================
+    # NEW: Position-based backward delivery
+    # ========================================================================
+    def handle_backward_delivery(self):
+        """Back up into the correct zone based on position tracking"""
+        if self.front_dist <= EMERGENCY_STOP_M:
+            self.set_state("STOPPED", "emergency front distance during backward delivery")
+            return
+        
+        # Timeout protection
+        if self.state_age() > DELIVERY_BACKWARD_TIMEOUT_SEC:
+            print(f"[DELIVERY] Backward delivery timeout ({DELIVERY_BACKWARD_TIMEOUT_SEC}s)")
+            self.stop_robot_once()
+            self.set_state("SERVO_UP_RELEASE", "delivery timeout, releasing cube")
+            return
+        
+        # Determine target zone
+        target_zone = self.position_tracker.get_zone_for_cube(self.grab_color or "red")
+        target_x = self.position_tracker.get_zone_boundary_x(target_zone)
+        
+        # Check if we've reached the target zone
+        if self.position_tracker.is_in_zone(target_zone):
+            print(f"[DELIVERY] Reached {target_zone}! x={self.position_tracker.x:.2f}m")
+            self.stop_robot_once()
+            self.set_state("SERVO_UP_RELEASE", f"cube delivered to {target_zone}")
+            return
+        
+        # Calculate distance to target
+        dist_to_target = abs(self.position_tracker.x - target_x)
+        
+        # Calculate steering to stay straight while backing
+        # Use marker if visible for steering reference, otherwise keep straight
+        steer = 0.0
+        if self.marker_visible and self.marker_obs is not None:
+            # Use marker as visual reference for steering
+            steer = -DELIVERY_BACKWARD_STEER_GAIN * self.marker_obs.error
+            steer = max(-DELIVERY_BACKWARD_STEER_MAX, min(DELIVERY_BACKWARD_STEER_MAX, steer))
+        
+        # Adjust speed based on distance to target
+        if dist_to_target < 0.1:
+            speed = DELIVERY_BACKWARD_SPEED * 0.5  # Slow down near target
+        else:
+            speed = DELIVERY_BACKWARD_SPEED
+        
+        # Print status periodically
+        if int(self.state_age() * 4) % 4 == 0:
+            print(f"[DELIVERY] Backing to {target_zone}: x={self.position_tracker.x:.2f}m, target={target_x:+.2f}m, dist={dist_to_target:.2f}m")
+        
+        self.publish_cmd(speed, steer)
 
     def handle_backup_after_grab(self):
-        """Short backup to secure cube before returning to zone"""
         if self.state_age() < BACKUP_AFTER_GRAB_SEC:
             self.publish_cmd(BACKUP_AFTER_GRAB_SPEED, 0.0)
             return
         self.stop_robot_once()
-        self.set_state("RETURN_TO_ZONE_POSITION", f"returning to {self.grab_color} zone position")
+        self.set_state("TURN_TO_DELIVERY_MARKER", f"find marker ids={sorted(self.delivery_marker_ids)}")
 
-    def handle_return_to_zone_position(self):
-        """Navigate backward to the recorded zone position"""
-        if self.target_zone_position is None:
+    def handle_turn_to_delivery_marker(self):
+        if self.state_age() > MARKER_TURN_TIMEOUT_SEC:
             self.stop_robot_once()
-            self.set_state("STOPPED", "No target zone position available")
+            if MARKER_TIMEOUT_STOP:
+                self.set_state("STOPPED", "delivery marker timeout, press H or restart")
+            else:
+                self.set_state("TURN_TO_DELIVERY_MARKER", "delivery marker timeout, keep turning")
             return
-        
-        # Check timeout
-        if self.state_age() > RETURN_TO_ZONE_TIMEOUT_SEC:
+
+        if not self.marker_visible or self.marker_obs is None or self.marker_obs.marker_id not in self.delivery_marker_ids:
+            self.marker_align_frames = 0
+            self.publish_cmd(0.0, MARKER_TURN_SPEED)
+            return
+
+        err = self.marker_obs.error
+        if abs(err) <= MARKER_ALIGN_PIXEL_TOL:
+            self.marker_align_frames += 1
             self.stop_robot_once()
-            self.set_state("SERVO_UP_RELEASE", "return to zone timeout, releasing")
+            if self.marker_align_frames >= MARKER_ALIGN_HOLD_FRAMES:
+                self.set_state("DRIVE_TO_DELIVERY_ZONE", f"marker {self.marker_obs.marker_id} aligned")
             return
-        
-        # Calculate distance to target zone
-        distance_to_zone = self.current_position.distance_to(self.target_zone_position)
-        
-        # Check if we've reached the zone
-        if distance_to_zone <= RETURN_TO_ZONE_POSITION_TOLERANCE:
+
+        self.marker_align_frames = 0
+        err_norm = err / max(self.image_width / 2.0, 1.0)
+        angular = self.clamp_abs(-0.28 * err_norm, 0.045, MARKER_TURN_SPEED)
+        self.publish_cmd(0.0, angular)
+
+    def handle_drive_to_delivery_zone(self):
+        age = self.state_age()
+        steer = 0.0
+        marker_ok = (
+            self.marker_visible
+            and self.marker_obs is not None
+            and self.marker_obs.marker_id in self.delivery_marker_ids
+        )
+
+        if marker_ok:
+            self.delivery_marker_seen_once = True
+            self.delivery_marker_lost_frames = 0
+            steer = -DELIVERY_STEER_GAIN * self.marker_obs.error
+            steer = max(-DELIVERY_STEER_MAX, min(DELIVERY_STEER_MAX, steer))
+            if age >= DELIVERY_FORWARD_MIN_SEC and self.marker_obs.width >= DELIVERY_MARKER_TOO_CLOSE_WIDTH:
+                self.stop_robot_once()
+                self.set_state("SERVO_UP_RELEASE", f"marker too close width={self.marker_obs.width:.0f}, release")
+                return
+        else:
+            self.delivery_marker_lost_frames += 1
+            if (
+                age >= DELIVERY_FORWARD_MIN_SEC
+                and self.delivery_marker_seen_once
+                and self.delivery_marker_lost_frames >= DELIVERY_MARKER_LOST_RELEASE_FRAMES
+            ):
+                self.stop_robot_once()
+                self.set_state("SERVO_UP_RELEASE", "delivery marker disappeared, release")
+                return
+
+        if age >= DELIVERY_FORWARD_MAX_SEC:
             self.stop_robot_once()
-            self.set_state("SERVO_UP_RELEASE", f"reached {self.grab_color} zone (dist={distance_to_zone:.3f}m)")
+            self.set_state("SERVO_UP_RELEASE", "delivery forward timeout 15s, release")
             return
-        
-        # Move backward toward zone
-        # Simple backward motion - could add steering based on angle to target
-        self.publish_cmd(-RETURN_TO_ZONE_SPEED, 0.0)
+
+        self.publish_cmd(DELIVERY_FORWARD_SPEED, steer)
 
     def handle_servo_up_release(self):
         self.stop_robot_reliable(repeat=5, delay=0.02)
@@ -1064,9 +1309,10 @@ class SimpleCubeMissionV42(Node):
             return
         self.stop_robot_once()
         self.completed_cycles += 1
+        self.moved_cubes += 1  # NEW: Count delivered cubes
         self.servo.servo_up()
         
-        # Update current zone based on what we just delivered
+        # Update zone based on delivery
         if self.grab_color == "red":
             self.current_zone = "RED_ZONE"
             self.last_zone_reason = "released_red_in_red_zone"
@@ -1074,9 +1320,59 @@ class SimpleCubeMissionV42(Node):
             self.current_zone = "BLUE_ZONE"
             self.last_zone_reason = "released_blue_in_blue_zone"
         
-        # Restart search
-        self.search_direction = SEARCH_START_DIRECTION
-        self.set_state("SEARCH", f"restart search, cycles={self.completed_cycles}")
+        print(f"[MISSION] Cubes delivered: {self.moved_cubes}")
+        print(f"[POS] Position after delivery: x={self.position_tracker.x:.2f}m, y={self.position_tracker.y:.2f}m")
+        
+        # NEW: Check if mission complete
+        if self.moved_cubes >= MAX_CUBES:
+            print(f"[MISSION] All {MAX_CUBES} cubes delivered!")
+            self.set_state("STOPPED", "mission complete")
+            return
+        
+        if RETURN_CENTER_AFTER_RELEASE:
+            self.set_state("RETURN_CENTER_AFTER_RELEASE", "use marker width to return near center")
+        else:
+            self.start_turn_relative(math.radians(TURN_AFTER_RELEASE_DEG), "TURN_AFTER_RELEASE_90")
+
+    def handle_return_center_after_release(self):
+        if self.state_age() > RETURN_CENTER_TIMEOUT_SEC:
+            self.stop_robot_once()
+            self.search_direction = SEARCH_START_DIRECTION
+            self.set_state("SEARCH", f"return-center timeout, restart search, cycles={self.completed_cycles}")
+            return
+
+        if not self.marker_visible or self.marker_obs is None:
+            self.publish_cmd(0.0, SEARCH_ANG)
+            return
+
+        err = self.marker_obs.error
+        steer = -RETURN_CENTER_STEER_GAIN * err
+        steer = max(-RETURN_CENTER_STEER_MAX, min(RETURN_CENTER_STEER_MAX, steer))
+        width_err = self.marker_obs.width - RETURN_CENTER_TARGET_MARKER_WIDTH
+
+        if abs(width_err) <= RETURN_CENTER_WIDTH_TOL:
+            if abs(err) <= MARKER_ALIGN_PIXEL_TOL * 1.5:
+                self.stop_robot_once()
+                self.search_direction = SEARCH_START_DIRECTION
+                self.set_state("SEARCH", f"center returned by marker width={self.marker_obs.width:.1f}, cycles={self.completed_cycles}")
+                return
+            self.publish_cmd(0.0, steer)
+            return
+
+        if width_err > 0:
+            self.publish_cmd(-RETURN_CENTER_SPEED, steer)
+        else:
+            self.publish_cmd(RETURN_CENTER_SPEED, steer)
+
+    def handle_turn_after_release_90(self):
+        err = self.normalize_angle(self.turn_target_yaw - self.local_yaw)
+        if abs(math.degrees(err)) <= TURN_AFTER_RELEASE_TOL_DEG:
+            self.stop_robot_once()
+            self.search_direction = SEARCH_START_DIRECTION
+            self.set_state("SEARCH", f"restart ccw search, cycles={self.completed_cycles}")
+            return
+        angular = self.clamp_abs(err * 0.75, 0.07, TURN_AFTER_RELEASE_SPEED)
+        self.publish_cmd(0.0, angular)
 
     def control_loop(self):
         if self.shutdown_requested:
@@ -1107,10 +1403,14 @@ class SimpleCubeMissionV42(Node):
             "APPROACH": self.handle_approach,
             "EXTRA_FORWARD_AFTER_LOST": self.handle_extra_forward_after_lost,
             "SERVO_DOWN": self.handle_servo_down,
+            "BACKWARD_DELIVERY": self.handle_backward_delivery,  # NEW
             "BACKUP_AFTER_GRAB": self.handle_backup_after_grab,
-            "RETURN_TO_ZONE_POSITION": self.handle_return_to_zone_position,
+            "TURN_TO_DELIVERY_MARKER": self.handle_turn_to_delivery_marker,
+            "DRIVE_TO_DELIVERY_ZONE": self.handle_drive_to_delivery_zone,
             "SERVO_UP_RELEASE": self.handle_servo_up_release,
             "BACKUP_AFTER_RELEASE": self.handle_backup_after_release,
+            "RETURN_CENTER_AFTER_RELEASE": self.handle_return_center_after_release,
+            "TURN_AFTER_RELEASE_90": self.handle_turn_after_release_90,
             "STOPPED": self.stop_robot_once,
         }
         handlers.get(self.state, self.stop_robot_once)()
@@ -1132,25 +1432,18 @@ class SimpleCubeMissionV42(Node):
                 f"holes={self.target_obs.holes} dist={self.target_obs.distance_cm:.1f}cm "
                 f"center_frames={self.center_seen_frames}"
             )
-        
-        # Position info
-        red_pos_text = f"({self.red_zone_position.x:.2f},{self.red_zone_position.y:.2f})" if self.red_zone_position else "unset"
-        blue_pos_text = f"({self.blue_zone_position.x:.2f},{self.blue_zone_position.y:.2f})" if self.blue_zone_position else "unset"
-        
-        # Distance to target zone during delivery
-        zone_dist_text = ""
-        if self.state == "RETURN_TO_ZONE_POSITION" and self.target_zone_position:
-            dist = self.current_position.distance_to(self.target_zone_position)
-            zone_dist_text = f" zone_dist={dist:.3f}m"
 
         print(
             f"[STATUS] {self.state} {target_text} grab={self.grab_color} "
-            f"pos=({self.current_position.x:.2f},{self.current_position.y:.2f}) "
-            f"red_zone={red_pos_text} blue_zone={blue_pos_text}{zone_dist_text} "
             f"zone={self.current_zone} want={self.current_target_color} lock={self.locked_search_color} "
             f"marker={self.marker_obs.marker_id if self.marker_obs else 'none'} "
+            f"merr={self.marker_obs.error if self.marker_obs else 0:.0f} "
+            f"zone_reason={self.last_zone_reason} "
             f"front={self.front_dist:.3f}m yaw={math.degrees(self.local_yaw):.0f} "
-            f"cycles={self.completed_cycles}"
+            f"pos=({self.position_tracker.x:.2f},{self.position_tracker.y:.2f}) "  # NEW
+            f"cubes={self.moved_cubes}/{MAX_CUBES} "  # NEW
+            f"lost={self.approach_lost_frames} cycles={self.completed_cycles} "
+            f"errors={self.detect_error_count} image=compressed {self.image_width}x{self.image_height}"
         )
 
     def destroy_node(self):
