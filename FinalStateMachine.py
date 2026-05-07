@@ -149,7 +149,7 @@ MAX_CUBES = 4
 
 # NEW: Pre-delivery rotation to avoid cube collisions
 PREDELIVERY_ROTATE_ANG = 0.176       # Rotation speed for pre-delivery turn
-PREDELIVERY_ROTATE_SEC = 0.5         # Duration of slight rotation (anti-clockwise)
+PREDELIVERY_ROTATE_SEC = 1.1       # Duration of slight rotation (anti-clockwise)
 PREDELIVERY_ROTATE_DIRECTION = 1.0   # 1.0 = anti-clockwise, -1.0 = clockwise
 
 @dataclass
@@ -1324,7 +1324,32 @@ class SimpleCubeMissionV42(Node):
     def handle_servo_up_release(self):
         self.stop_robot_reliable(repeat=5, delay=0.02)
         self.servo.servo_up()
-        self.set_state("BACKUP_AFTER_RELEASE", "backup 1s")
+        self.completed_cycles += 1
+        self.moved_cubes += 1
+        self.servo.servo_up()
+        
+        # Update zone based on delivery
+        if self.grab_color == "red":
+            self.current_zone = "RED_ZONE"
+            self.last_zone_reason = "released_red_in_red_zone"
+        elif self.grab_color == "blue":
+            self.current_zone = "BLUE_ZONE"
+            self.last_zone_reason = "released_blue_in_blue_zone"
+        
+        print(f"[MISSION] Cubes delivered: {self.moved_cubes}/{MAX_CUBES}")
+        print(f"[POS] Position after delivery: x={self.position_tracker.x:.2f}m, y={self.position_tracker.y:.2f}m")
+        
+        # Check if mission complete
+        if self.moved_cubes >= MAX_CUBES:
+            print(f"[MISSION] All {MAX_CUBES} cubes delivered!")
+            self.set_state("STOPPED", "mission complete")
+            return
+        
+        # Skip BACKUP_AFTER_RELEASE - go directly to return center or turn
+        if RETURN_CENTER_AFTER_RELEASE:
+            self.set_state("RETURN_CENTER_AFTER_RELEASE", "return to center after release")
+        else:
+            self.start_turn_relative(math.radians(TURN_AFTER_RELEASE_DEG), "TURN_AFTER_RELEASE_90")
 
     def handle_backup_after_release(self):
         if self.state_age() < BACKUP_AFTER_RELEASE_SEC:
@@ -1426,12 +1451,12 @@ class SimpleCubeMissionV42(Node):
             "APPROACH": self.handle_approach,
             "EXTRA_FORWARD_AFTER_LOST": self.handle_extra_forward_after_lost,
             "SERVO_DOWN": self.handle_servo_down,
-            "BACKWARD_DELIVERY": self.handle_backward_delivery,  # NEW
+            "BACKWARD_DELIVERY": self.handle_backward_delivery,
             "BACKUP_AFTER_GRAB": self.handle_backup_after_grab,
             "TURN_TO_DELIVERY_MARKER": self.handle_turn_to_delivery_marker,
             "DRIVE_TO_DELIVERY_ZONE": self.handle_drive_to_delivery_zone,
             "SERVO_UP_RELEASE": self.handle_servo_up_release,
-            "BACKUP_AFTER_RELEASE": self.handle_backup_after_release,
+            # "BACKUP_AFTER_RELEASE": self.handle_backup_after_release,  # REMOVED
             "RETURN_CENTER_AFTER_RELEASE": self.handle_return_center_after_release,
             "TURN_AFTER_RELEASE_90": self.handle_turn_after_release_90,
             "STOPPED": self.stop_robot_once,
