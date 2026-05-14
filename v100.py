@@ -26,9 +26,12 @@ except Exception:
 # RED_ZONE = west/left side, marker ID 0. BLUE_ZONE = east/right side, marker ID 23.
 # Change this one line before the match if your assigned target half is the other side.
 COMPETITION_TARGET_ZONE = "RED_ZONE"
-MAX_COMPETITION_DELIVERIES = 2
-STOP_AFTER_MAX_DELIVERIES = True
+# Keep running until manual stop or match end. The counter is not a reliable score:
+# a release action can fail, and in a shared arena another robot can move cubes later.
+MAX_COMPETITION_DELIVERIES = 999
+STOP_AFTER_MAX_DELIVERIES = False
 IGNORE_CUBES_ALREADY_IN_TARGET_ZONE = True
+IGNORE_ONLY_WITH_CONFIDENT_ZONE = True
 
 DEFAULT_TARGET_COLOR = "any"
 PREFER_BLUE = False
@@ -65,7 +68,7 @@ MARKER_ALIGN_PIXEL_TOL = 24.0
 MARKER_ALIGN_HOLD_FRAMES = 2
 MARKER_TURN_SPEED = 0.220
 MARKER_TURN_TIMEOUT_SEC = 35.0
-MARKER_TIMEOUT_STOP = True
+MARKER_TIMEOUT_STOP = False
 ZONE_MARKER_STABLE_FRAMES = 3
 
 DELIVERY_FORWARD_SPEED = 0.116
@@ -594,7 +597,11 @@ class SimpleCubeMissionV100(Node):
             f"NORTH_LINE={sorted(NORTH_LINE_MARKER_IDS)} SOUTH_LINE={sorted(SOUTH_LINE_MARKER_IDS)}"
         )
         print(f"[TARGET] competition target zone={COMPETITION_TARGET_ZONE}, marker ids={sorted(self.target_zone_marker_ids())}")
-        print(f"[TARGET] search color={DEFAULT_TARGET_COLOR}, max deliveries={MAX_COMPETITION_DELIVERIES}")
+        print(
+            f"[TARGET] search color={DEFAULT_TARGET_COLOR}, "
+            f"auto_stop={STOP_AFTER_MAX_DELIVERIES}, max deliveries={MAX_COMPETITION_DELIVERIES}, "
+            f"marker_timeout_stop={MARKER_TIMEOUT_STOP}"
+        )
         print(f"[SERVO] UP={SERVO_UP_DUTY} DOWN={SERVO_DOWN_DUTY} BCM={SERVO_GPIO_BCM}")
         print("[CMD] type H then Enter to stop and exit")
 
@@ -849,6 +856,18 @@ class SimpleCubeMissionV100(Node):
     def in_target_zone(self):
         return self.current_zone == COMPETITION_TARGET_ZONE
 
+    def confidently_in_target_zone(self):
+        if not self.in_target_zone():
+            return False
+        if not IGNORE_ONLY_WITH_CONFIDENT_ZONE:
+            return True
+        return self.last_zone_reason in (
+            "direct_red_marker",
+            "direct_blue_marker",
+            "north_line_buffer",
+            "south_line_buffer",
+        )
+
     def active_target_color(self):
         if self.locked_search_color is not None:
             self.current_target_color = self.locked_search_color
@@ -897,18 +916,17 @@ class SimpleCubeMissionV100(Node):
 
         self.active_target_color()
         if self.target_visible and self.target_obs is not None:
-            if IGNORE_CUBES_ALREADY_IN_TARGET_ZONE and self.in_target_zone():
+            if IGNORE_CUBES_ALREADY_IN_TARGET_ZONE and self.confidently_in_target_zone():
                 self.center_seen_frames = 0
                 self.publish_cmd(0.0, self.search_direction * SEARCH_ANG)
                 return
-            if self.locked_search_color is None:
-                self.locked_search_color = self.target_obs.color
-                self.current_target_color = self.locked_search_color
             if self.target_centered():
                 self.center_seen_frames += 1
                 self.stop_robot_once()
                 if self.center_seen_frames >= MIN_CENTER_FRAMES:
                     self.grab_color = self.target_obs.color
+                    self.locked_search_color = self.grab_color
+                    self.current_target_color = self.grab_color
                     self.remember_target_for_capture()
                     self.set_state("CENTER_STOP", f"{self.grab_color} centered, short stop")
                 return
@@ -1016,11 +1034,14 @@ class SimpleCubeMissionV100(Node):
 
     def handle_turn_to_delivery_marker(self):
         if self.state_age() > MARKER_TURN_TIMEOUT_SEC:
-            self.stop_robot_once()
             if MARKER_TIMEOUT_STOP:
+                self.stop_robot_once()
                 self.set_state("STOPPED", "delivery marker timeout, press H or restart")
             else:
-                self.set_state("TURN_TO_DELIVERY_MARKER", "delivery marker timeout, keep turning")
+                self.state_enter_time = time.monotonic()
+                self.marker_align_frames = 0
+                print("[STATE] TURN_TO_DELIVERY_MARKER | marker timeout, keep searching")
+                self.publish_cmd(0.0, MARKER_TURN_SPEED)
             return
 
         if not self.marker_visible or self.marker_obs is None or self.marker_obs.marker_id not in self.delivery_marker_ids:
